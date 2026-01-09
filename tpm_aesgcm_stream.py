@@ -6,6 +6,8 @@ import base64
 import getpass
 import subprocess
 from pathlib import Path
+from datetime import datetime
+from typing import Optional
 
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
@@ -13,10 +15,6 @@ from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 # ---------- 공용 유틸 ----------
 
 def run_cmd(args, input_bytes=None):
-    """
-    tpm2-tools용 subprocess 래퍼.
-    에러 발생 시 예외 발생.
-    """
     result = subprocess.run(
         args,
         input=input_bytes,
@@ -33,81 +31,133 @@ def run_cmd(args, input_bytes=None):
     return result.stdout
 
 
-def ensure_primary(primary_ctx="primary.ctx"):
-    if Path(primary_ctx).exists():
+def get_obj_auth():
+    auth = os.environ.get("TPM_OBJECT_AUTH")
+    if auth:
+        return auth
+    return getpass.getpass("TPM object auth (will not echo): ")
+
+
+def b64e(b: bytes) -> str:
+    return base64.b64encode(b).decode("ascii")
+
+
+def b64d(s: str) -> bytes:
+    return base64.b64decode(s.encode("ascii"))
+
+
+def safe_name(name: str) -> str:
+    # Linux 기준 최소 치환
+    return name.replace("/", "_")
+
+
+def ts_now_name() -> str:
+    """
+    파일/폴더명용:
+      YYYY-MM-DDTHH-MM-SS  (콜론 ':' 대신 하이픈 '-')
+    """
+    return datetime.now().strftime("%Y-%m-%dT%H-%M-%S")
+
+
+def unique_path(base: Path) -> Path:
+    if not base.exists():
+        return base
+    i = 1
+    while True:
+        cand = Path(f"{base}_{i:02d}")
+        if not cand.exists():
+            return cand
+        i += 1
+
+
+def make_bundle_dir(input_path: Path, created_at_name: str) -> Path:
+    """
+    번들 폴더명:
+      <YYYY-MM-DDTHH-MM-SS>_<입력파일명(확장자 제외)>
+    """
+    stem = safe_name(input_path.stem)
+    bundle = Path(f"{created_at_name}_{stem}")
+    bundle = unique_path(bundle)
+    bundle.mkdir(parents=False, exist_ok=False)
+    return bundle
+
+
+# ---------- TPM (auth-only) ----------
+
+def ensure_primary(primary_ctx: Path):
+    if primary_ctx.exists():
         return
     print("[*] Creating primary key (owner hierarchy)...")
-    run_cmd(["tpm2_createprimary", "-C", "o", "-c", primary_ctx])
+    run_cmd(["tpm2_createprimary", "-C", "o", "-c", str(primary_ctx)])
 
 
-# ---------- TPM 관련 함수 (auth-only) ----------
-
-def tpm_get_random(num_bytes=32):
+def tpm_get_random(num_bytes=32) -> bytes:
     print(f"[*] Getting {num_bytes} random bytes from TPM...")
     return run_cmd(["tpm2_getrandom", str(num_bytes)])
 
 
-def tpm_seal_key(key_bytes: bytes, key_name: str, obj_auth: str, primary_ctx="primary.ctx"):
-    """
-    authValue(비밀번호)로 sealed object 생성
-    -> key_name.pub, key_name.priv 생성
-    """
+def tpm_seal_key(key_bytes: bytes, key_prefix: Path, obj_auth: str, primary_ctx: Path):
     ensure_primary(primary_ctx)
 
-    tmp_key_file = f"{key_name}.key.bin"
-    with open(tmp_key_file, "wb") as f:
+    tmp_key_file = key_prefix.with_suffix(".key.bin")
+    pub_file = key_prefix.with_suffix(".pub")
+    priv_file = key_prefix.with_suffix(".priv")
+
+    with tmp_key_file.open("wb") as f:
         f.write(key_bytes)
 
-    print(f"[*] Sealing AES key into TPM (key_name={key_name}) with auth only...")
+    print("[*] Sealing AES key into TPM (auth-only)...")
     run_cmd([
         "tpm2_create",
-        "-C", primary_ctx,
-        "-u", f"{key_name}.pub",
-        "-r", f"{key_name}.priv",
-        "-i", tmp_key_file,
+        "-C", str(primary_ctx),
+        "-u", str(pub_file),
+        "-r", str(priv_file),
+        "-i", str(tmp_key_file),
         "-p", f"str:{obj_auth}",
         "-a", "fixedtpm|fixedparent|userwithauth",
     ])
 
-    os.remove(tmp_key_file)
-    print("[*] Sealed key files generated:", f"{key_name}.pub", f"{key_name}.priv")
+    try:
+        tmp_key_file.unlink()
+    except Exception:
+        pass
+
+    print("[*] Sealed key files generated:", pub_file.name, priv_file.name)
 
 
-def tpm_unseal_key(key_name: str, obj_auth: str, primary_ctx="primary.ctx") -> bytes:
-    """
-    key_name.pub/priv를 load 후 auth로 unseal
-    """
+def tpm_unseal_key(key_prefix: Path, obj_auth: str, primary_ctx: Path) -> bytes:
     ensure_primary(primary_ctx)
 
-    pub = Path(f"{key_name}.pub")
-    priv = Path(f"{key_name}.priv")
-    if not (pub.exists() and priv.exists()):
-        raise FileNotFoundError(f"Sealed key files not found: {pub}, {priv}")
+    pub_file = key_prefix.with_suffix(".pub")
+    priv_file = key_prefix.with_suffix(".priv")
+    if not pub_file.exists() or not priv_file.exists():
+        raise FileNotFoundError(f"Sealed key files not found: {pub_file}, {priv_file}")
 
-    ctx_file = f"{key_name}.ctx"
-    print(f"[*] Loading sealed key object (key_name={key_name})...")
+    ctx_file = key_prefix.with_suffix(".ctx")
+
+    print("[*] Loading sealed key object...")
     run_cmd([
         "tpm2_load",
-        "-C", primary_ctx,
-        "-u", str(pub),
-        "-r", str(priv),
-        "-c", ctx_file,
+        "-C", str(primary_ctx),
+        "-u", str(pub_file),
+        "-r", str(priv_file),
+        "-c", str(ctx_file),
     ])
 
     try:
-        print("[*] Unsealing key from TPM with auth only...")
+        print("[*] Unsealing key from TPM (auth-only)...")
         key_bytes = run_cmd([
             "tpm2_unseal",
-            "-c", ctx_file,
+            "-c", str(ctx_file),
             "-p", f"str:{obj_auth}",
         ])
     finally:
         try:
-            run_cmd(["tpm2_flushcontext", "-c", ctx_file])
+            run_cmd(["tpm2_flushcontext", "-c", str(ctx_file)])
         except Exception:
             pass
         try:
-            os.remove(ctx_file)
+            ctx_file.unlink()
         except Exception:
             pass
 
@@ -116,122 +166,145 @@ def tpm_unseal_key(key_name: str, obj_auth: str, primary_ctx="primary.ctx") -> b
     return key_bytes
 
 
-# ---------- AES-GCM 스트리밍 암/복호화 ----------
+# ---------- 스트리밍 AES-GCM ----------
 
-def b64e(b: bytes) -> str:
-    return base64.b64encode(b).decode("ascii")
-
-def b64d(s: str) -> bytes:
-    return base64.b64decode(s.encode("ascii"))
-
-def get_obj_auth():
-    auth = os.environ.get("TPM_OBJECT_AUTH")
-    if auth:
-        return auth
-    return getpass.getpass("TPM object auth (will not echo): ")
-
-
-def encrypt_file_stream(
+def encrypt_auto_bundle(
     input_path: str,
-    out_enc_path: str,
-    out_meta_path: str,
-    key_name: str,
-    aad: bytes | None = None,
-    chunk_size: int = 4 * 1024 * 1024,  # 4MB
+    aad: Optional[bytes] = None,
+    chunk_size: int = 4 * 1024 * 1024,
 ):
     """
-    - input_path: 평문 파일
-    - out_enc_path: 암호문 바이너리 (*.enc)
-    - out_meta_path: 메타데이터 JSON (*.meta.json)
-    - key_name: TPM sealed key prefix (key_name.pub/priv 생성)
+    입력 파일 1개를 받아서:
+      - <YYYY-MM-DDTHH-MM-SS>_<file_stem>/ 폴더 생성
+      - 폴더 안에 .enc / .meta.json / .pub/.priv / primary.ctx 자동 생성
+      - 성공 시 원본 파일 삭제
     """
     input_path = Path(input_path)
-    out_enc_path = Path(out_enc_path)
-    out_meta_path = Path(out_meta_path)
+    if not input_path.exists():
+        raise FileNotFoundError(f"Input file not found: {input_path}")
 
     obj_auth = get_obj_auth()
+    created_at_name = ts_now_name()
 
-    # 1) TPM RNG로 AES-256 키 생성
-    key = tpm_get_random(32)
-    if len(key) != 32:
-        raise RuntimeError(f"TPM random length != 32: {len(key)}")
+    bundle_dir = make_bundle_dir(input_path, created_at_name=created_at_name)
+    base = bundle_dir.name  # 폴더명과 동일 prefix
 
-    # 2) Nonce 생성 (GCM 권장 96-bit)
-    nonce = os.urandom(12)
+    enc_path = bundle_dir / f"{base}.enc"
+    meta_path = bundle_dir / f"{base}.meta.json"
+    key_prefix = bundle_dir / base
+    primary_ctx = bundle_dir / "primary.ctx"
 
-    # 3) GCM encryptor 준비 (스트리밍)
-    encryptor = Cipher(
-        algorithms.AES(key),
-        modes.GCM(nonce),
-    ).encryptor()
+    # 여기까지 오면 번들 디렉토리는 생성된 상태.
+    # 암호화 실패 시 원본 파일은 삭제하지 않음.
+    try:
+        # 1) 키 생성
+        key = tpm_get_random(32)
+        if len(key) != 32:
+            raise RuntimeError(f"TPM random length != 32: {len(key)}")
 
-    if aad is not None:
-        encryptor.authenticate_additional_data(aad)
+        # 2) nonce
+        nonce = os.urandom(12)
 
-    # 4) 스트리밍 암호화: plaintext -> ciphertext
-    print(f"[*] Streaming encrypt: {input_path} -> {out_enc_path}")
-    total_in = 0
-    total_out = 0
+        # 3) encryptor
+        encryptor = Cipher(
+            algorithms.AES(key),
+            modes.GCM(nonce),
+        ).encryptor()
+        if aad is not None:
+            encryptor.authenticate_additional_data(aad)
 
-    with input_path.open("rb") as fin, out_enc_path.open("wb") as fout:
-        while True:
-            chunk = fin.read(chunk_size)
-            if not chunk:
-                break
-            total_in += len(chunk)
-            c = encryptor.update(chunk)
-            if c:
-                fout.write(c)
-                total_out += len(c)
+        # 4) 스트리밍 암호화
+        print(f"[*] Bundle dir: {bundle_dir}")
+        print(f"[*] Streaming encrypt: {input_path} -> {enc_path}")
 
-        # finalize() 호출 후 tag 확정
-        tail = encryptor.finalize()
-        if tail:
-            fout.write(tail)
-            total_out += len(tail)
+        total_in = 0
+        total_out = 0
 
-    tag = encryptor.tag
+        with input_path.open("rb") as fin, enc_path.open("wb") as fout:
+            while True:
+                chunk = fin.read(chunk_size)
+                if not chunk:
+                    break
+                total_in += len(chunk)
+                c = encryptor.update(chunk)
+                if c:
+                    fout.write(c)
+                    total_out += len(c)
 
-    # 5) meta.json 기록 (작게)
-    meta = {
-        "version": 1,
-        "cipher": "AES-256-GCM",
-        "key_name": key_name,
-        "sealed_pub": f"{key_name}.pub",
-        "sealed_priv": f"{key_name}.priv",
-        "nonce_b64": b64e(nonce),
-        "tag_b64": b64e(tag),
-        "aad_b64": None if aad is None else b64e(aad),
-        "chunk_size": chunk_size,
-        "plaintext_bytes": total_in,
-        "ciphertext_bytes": total_out,
-    }
-    out_meta_path.write_text(json.dumps(meta, indent=2))
-    print(f"[*] Wrote meta: {out_meta_path}")
+            tail = encryptor.finalize()
+            if tail:
+                fout.write(tail)
+                total_out += len(tail)
 
-    # 6) 키를 TPM에 seal (auth-only)
-    tpm_seal_key(key, key_name, obj_auth=obj_auth)
-    print("[*] Encryption + TPM seal completed.")
+        tag = encryptor.tag
+
+        # 5) TPM seal
+        tpm_seal_key(key, key_prefix=key_prefix, obj_auth=obj_auth, primary_ctx=primary_ctx)
+
+        # 6) meta 저장
+        meta = {
+            "version": 5,
+            "cipher": "AES-256-GCM",
+            "created_at_name": created_at_name,  # 복호화 파일명에도 사용
+
+            "source_filename": input_path.name,  # 복호화 시 원본 파일명으로 복원
+            "source_stem": input_path.stem,
+            "bundle_dir": bundle_dir.name,
+
+            "enc_file": enc_path.name,
+            "nonce_b64": b64e(nonce),
+            "tag_b64": b64e(tag),
+            "aad_b64": None if aad is None else b64e(aad),
+
+            "key_prefix": base,
+            "sealed_pub": f"{base}.pub",
+            "sealed_priv": f"{base}.priv",
+            "primary_ctx": "primary.ctx",
+
+            "chunk_size": chunk_size,
+            "plaintext_bytes": total_in,
+            "ciphertext_bytes": total_out,
+        }
+        meta_path.write_text(json.dumps(meta, indent=2))
+
+        print(f"[*] Wrote meta: {meta_path}")
+        print("[*] Encryption + TPM seal completed.")
+
+    except Exception:
+        # 실패 시 원본은 유지
+        print("[!] Encryption failed; original file was NOT deleted.")
+        raise
+
+    # 7) 여기까지 성공했으면 원본 삭제
+    try:
+        input_path.unlink()
+        print(f"[*] Original file deleted: {input_path}")
+    except Exception as e:
+        # 암호화 산출물은 이미 만들어진 상태이므로, 삭제 실패는 경고만
+        print(f"[!] Warning: failed to delete original file: {input_path} ({e})")
+
+    print(f"[*] Output bundle: {bundle_dir}")
 
 
-def decrypt_file_stream(
-    in_enc_path: str,
-    in_meta_path: str,
-    output_path: str,
-    chunk_size: int | None = None,
-):
+def decrypt_from_meta_restore_original_name(meta_path: str, chunk_size: Optional[int] = None) -> Path:
     """
-    - in_enc_path: 암호문 바이너리 (*.enc)
-    - in_meta_path: 메타데이터 JSON (*.meta.json)
-    - output_path: 복호화 평문 파일
+    meta.json만 주면 같은 폴더의 .enc / sealed key / primary.ctx를 자동 사용
+    출력 파일명은 원본 파일명(source_filename)으로 "그대로" 복원.
+    저장 위치: meta.json이 있는 번들 폴더
+
+    주의: 번들 폴더에 같은 이름 파일이 이미 있으면 overwrite 됨(atomic replace).
     """
-    in_enc_path = Path(in_enc_path)
-    in_meta_path = Path(in_meta_path)
-    output_path = Path(output_path)
+    meta_path = Path(meta_path)
+    if not meta_path.exists():
+        raise FileNotFoundError(f"Meta file not found: {meta_path}")
 
-    meta = json.loads(in_meta_path.read_text())
+    base_dir = meta_path.parent
+    meta = json.loads(meta_path.read_text())
 
-    key_name = meta["key_name"]
+    enc_path = base_dir / meta["enc_file"]
+    primary_ctx = base_dir / meta.get("primary_ctx", "primary.ctx")
+    key_prefix = base_dir / meta["key_prefix"]
+
     nonce = b64d(meta["nonce_b64"])
     tag = b64d(meta["tag_b64"])
     aad_b64 = meta.get("aad_b64")
@@ -242,25 +315,30 @@ def decrypt_file_stream(
 
     obj_auth = get_obj_auth()
 
-    # 1) TPM에서 키 unseal
-    key = tpm_unseal_key(key_name, obj_auth=obj_auth)
+    # 출력 파일명: 원본 파일명 그대로
+    source_filename = meta.get("source_filename")
+    if not source_filename:
+        raise KeyError("meta.json missing 'source_filename'")
 
-    # 2) GCM decryptor 준비 (tag 포함)
+    out_path = base_dir / source_filename
+    tmp_out = Path(str(out_path) + ".part")
+
+    # 1) 키 unseal
+    key = tpm_unseal_key(key_prefix=key_prefix, obj_auth=obj_auth, primary_ctx=primary_ctx)
+
+    # 2) decryptor
     decryptor = Cipher(
         algorithms.AES(key),
         modes.GCM(nonce, tag),
     ).decryptor()
-
     if aad is not None:
         decryptor.authenticate_additional_data(aad)
 
-    # 3) 스트리밍 복호화: ciphertext -> plaintext
-    print(f"[*] Streaming decrypt: {in_enc_path} -> {output_path}")
-    wrote = 0
-    tmp_out = output_path.with_suffix(output_path.suffix + ".part")
+    # 3) 스트리밍 복호화
+    print(f"[*] Streaming decrypt: {enc_path} -> {out_path}")
 
     try:
-        with in_enc_path.open("rb") as fin, tmp_out.open("wb") as fout:
+        with enc_path.open("rb") as fin, tmp_out.open("wb") as fout:
             while True:
                 chunk = fin.read(chunk_size)
                 if not chunk:
@@ -268,18 +346,19 @@ def decrypt_file_stream(
                 p = decryptor.update(chunk)
                 if p:
                     fout.write(p)
-                    wrote += len(p)
 
-            # finalize()에서 tag 검증
-            tail = decryptor.finalize()
+            tail = decryptor.finalize()  # tag 검증
             if tail:
                 fout.write(tail)
-                wrote += len(tail)
 
-        tmp_out.replace(output_path)
-        print(f"[*] Decryption completed. bytes={wrote}")
+        # atomic replace (기존 out_path가 있으면 덮어씀)
+        tmp_out.replace(out_path)
+
+        print("[*] Decryption completed.")
+        print(f"[*] Restored file: {out_path}")
+        return out_path
+
     except Exception:
-        # 실패 시 부분 파일 제거(무결성 실패/키 불일치 등)
         try:
             if tmp_out.exists():
                 tmp_out.unlink()
@@ -292,16 +371,17 @@ def decrypt_file_stream(
 
 def print_usage():
     print("Usage:")
-    print("  Encrypt: python tpm_aesgcm_stream.py encrypt <in_file> <out.enc> <out.meta.json> <key_name>")
-    print("  Decrypt: python tpm_aesgcm_stream.py decrypt <in.enc> <in.meta.json> <out_file>")
+    print("  Encrypt (auto bundle + delete original):")
+    print("    python tpm_aesgcm_stream.py encrypt <in_file>")
     print("")
-    print("Notes:")
-    print("  - out.enc 는 바이너리 ciphertext")
-    print("  - out.meta.json 에 nonce/tag/key_name 등이 저장됨")
-    print("  - TPM_OBJECT_AUTH 환경변수로 auth 입력 생략 가능")
+    print("  Decrypt (meta-driven + restore original filename):")
+    print("    python tpm_aesgcm_stream.py decrypt <in.meta.json>")
+    print("")
+    print("Env:")
+    print("  TPM_OBJECT_AUTH='...'  (optional)")
 
 
-if __name__ == "__main__":
+def main():
     if len(sys.argv) < 2:
         print_usage()
         sys.exit(1)
@@ -310,23 +390,16 @@ if __name__ == "__main__":
 
     try:
         if mode == "encrypt":
-            if len(sys.argv) != 6:
+            if len(sys.argv) != 3:
                 print_usage()
                 sys.exit(1)
-            in_file = sys.argv[2]
-            out_enc = sys.argv[3]
-            out_meta = sys.argv[4]
-            key_name = sys.argv[5]
-            encrypt_file_stream(in_file, out_enc, out_meta, key_name)
+            encrypt_auto_bundle(sys.argv[2])
 
         elif mode == "decrypt":
-            if len(sys.argv) != 5:
+            if len(sys.argv) != 3:
                 print_usage()
                 sys.exit(1)
-            in_enc = sys.argv[2]
-            in_meta = sys.argv[3]
-            out_file = sys.argv[4]
-            decrypt_file_stream(in_enc, in_meta, out_file)
+            decrypt_from_meta_restore_original_name(sys.argv[2])
 
         else:
             print_usage()
@@ -335,3 +408,7 @@ if __name__ == "__main__":
     except Exception as e:
         print("[!] Error:", e)
         sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
