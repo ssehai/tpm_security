@@ -5,6 +5,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cerrno>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -55,6 +56,67 @@ static std::string safe_name(std::string s) {
     for (auto& c : s) if (c == '/') c = '_';
     return s;
 }
+
+static std::string format_duration(double seconds) {
+    if (seconds < 0 || !std::isfinite(seconds)) return "--:--:--";
+    auto s = static_cast<int64_t>(seconds + 0.5);
+    int64_t h = s / 3600;
+    int64_t m = (s % 3600) / 60;
+    int64_t sec = s % 60;
+    std::ostringstream oss;
+    oss << std::setw(2) << std::setfill('0') << h << ":"
+        << std::setw(2) << std::setfill('0') << m << ":"
+        << std::setw(2) << std::setfill('0') << sec;
+    return oss.str();
+}
+
+struct ProgressMeter {
+    std::string label;
+    uint64_t total = 0;
+    std::chrono::steady_clock::time_point start;
+    std::chrono::steady_clock::time_point last_report;
+    uint64_t last_value = 0;
+    bool enabled = false;
+
+    void start_meter(const std::string& name, uint64_t total_value) {
+        label = name;
+        total = total_value;
+        start = std::chrono::steady_clock::now();
+        last_report = start;
+        last_value = 0;
+        enabled = (total > 0);
+        if (enabled) {
+            std::cerr << "[*] " << label << " started (total=" << total << ")\n";
+        }
+    }
+
+    void update(uint64_t value, bool force = false) {
+        if (!enabled) return;
+        if (value > total) value = total;
+        auto now = std::chrono::steady_clock::now();
+        auto since = now - last_report;
+        if (!force && since < std::chrono::seconds(1) && value < total) return;
+
+        double elapsed = std::chrono::duration_cast<std::chrono::duration<double>>(now - start).count();
+        double rate = elapsed > 0.0 ? (double)value / elapsed : 0.0;
+        double remaining = (rate > 0.0) ? (double)(total - value) / rate : -1.0;
+        int pct = total > 0 ? (int)((double)value * 100.0 / (double)total) : 0;
+
+        std::cerr << "[*] " << label << " " << pct << "% ("
+                  << value << "/" << total << ") ETA " << format_duration(remaining) << "\n";
+        last_report = now;
+        last_value = value;
+    }
+
+    void finish(uint64_t value) {
+        if (!enabled) return;
+        update(value, true);
+        auto now = std::chrono::steady_clock::now();
+        double elapsed = std::chrono::duration_cast<std::chrono::duration<double>>(now - start).count();
+        std::cerr << "[*] " << label << " done in " << format_duration(elapsed) << "\n";
+        enabled = false;
+    }
+};
 
 static fs::path unique_path(const fs::path& base) {
     if (!fs::exists(base)) return base;
@@ -533,6 +595,14 @@ static void aes_gcm_decrypt_file(const fs::path& in_path,
     std::ofstream fout(out_tmp, std::ios::binary);
     if (!fout) fail("open out tmp failed");
 
+    uint64_t total_bytes = 0;
+    std::error_code ec;
+    total_bytes = fs::file_size(in_path, ec);
+    ProgressMeter progress;
+    if (!ec && total_bytes > 0) {
+        progress.start_meter("Decrypt " + in_path.filename().string(), total_bytes);
+    }
+
     int ok = EVP_DecryptInit_ex(ctx, EVP_aes_256_gcm(), nullptr, nullptr, nullptr);
     if (ok != 1) fail("DecryptInit failed");
     ok = EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_IVLEN, 12, nullptr);
@@ -553,10 +623,14 @@ static void aes_gcm_decrypt_file(const fs::path& in_path,
     std::vector<uint8_t> inbuf(chunk_size);
     std::vector<uint8_t> outbuf(chunk_size + 16);
 
+    uint64_t done = 0;
     while (fin) {
         fin.read((char*)inbuf.data(), inbuf.size());
         std::streamsize got = fin.gcount();
         if (got <= 0) break;
+
+        done += static_cast<uint64_t>(got);
+        progress.update(done);
 
         int outlen = 0;
         ok = EVP_DecryptUpdate(ctx, outbuf.data(), &outlen, inbuf.data(), (int)got);
@@ -575,6 +649,7 @@ static void aes_gcm_decrypt_file(const fs::path& in_path,
     }
 
     EVP_CIPHER_CTX_free(ctx);
+    progress.finish(done);
 }
 
 struct Chunk {
@@ -774,28 +849,12 @@ struct EncPipeline {
         gst_app_src_end_of_stream(GST_APP_SRC(appsrc));
 
         GstBus* bus = gst_element_get_bus(pipeline);
-        bool done = false;
-        guint64 waited_ns = 0;
-        const guint64 wait_step_ns = 500 * GST_MSECOND;
-        const guint64 max_wait_ns = 8 * GST_SECOND;
-        while (!done && waited_ns <= max_wait_ns) {
-            GstMessage* msg = gst_bus_timed_pop_filtered(
-                bus,
-                wait_step_ns,
-                (GstMessageType)(GST_MESSAGE_ERROR | GST_MESSAGE_EOS)
-            );
-            waited_ns += wait_step_ns;
-            if (!msg) continue;
-            switch (GST_MESSAGE_TYPE(msg)) {
-                case GST_MESSAGE_EOS:
-                    done = true;
-                    break;
-                case GST_MESSAGE_ERROR:
-                    done = true;
-                    break;
-                default:
-                    break;
-            }
+        GstMessage* msg = gst_bus_timed_pop_filtered(
+            bus,
+            GST_CLOCK_TIME_NONE,
+            (GstMessageType)(GST_MESSAGE_ERROR | GST_MESSAGE_EOS)
+        );
+        if (msg) {
             gst_message_unref(msg);
         }
 
@@ -819,37 +878,29 @@ struct SegmentWriter {
     std::string created_at;
     fs::path bundle_dir;
     fs::path primary_ctx;
-    fs::path person_dir;
-    fs::path background_dir;
-    fs::path enc_person_path;
-    fs::path enc_bg_path;
-    fs::path meta_person_path;
-    fs::path meta_bg_path;
-    fs::path key_person_prefix;
-    fs::path key_bg_prefix;
+    fs::path full_dir;
+    fs::path enc_full_path;
+    fs::path meta_full_path;
+    fs::path key_full_prefix;
 
     uint64_t start_ns = 0;
     uint64_t last_ts_ns = 0;
+    uint64_t segment_len_ns = 0;
     uint32_t width = 0;
     uint32_t height = 0;
     uint32_t fps_num = 30;
     uint32_t fps_den = 1;
 
-    std::vector<uint8_t> key_person;
-    std::vector<uint8_t> nonce_person;
-    std::vector<uint8_t> key_bg;
-    std::vector<uint8_t> nonce_bg;
+    std::vector<uint8_t> key_full;
+    std::vector<uint8_t> nonce_full;
     std::vector<uint8_t> aad;
 
-    std::optional<fs::path> policy_person_file;
-    std::optional<fs::path> policy_bg_file;
-    std::optional<fs::path> signer_pub_person;
-    std::optional<fs::path> signer_pub_bg;
+    std::optional<fs::path> policy_full_file;
+    std::optional<fs::path> signer_pub_full;
 
-    EncPipeline person;
-    EncPipeline background;
+    EncPipeline full;
     std::chrono::steady_clock::time_point start_wall;
-    uint64_t split_ns = 0;
+    ProgressMeter enc_progress;
     std::function<secure_save::SealArtifacts(const std::vector<uint8_t>&,
                                              const fs::path&,
                                              const fs::path&)> seal_cb;
@@ -861,6 +912,7 @@ struct SegmentWriter {
               uint32_t fpsn,
               uint32_t fpsd,
               uint64_t start_ts_ns,
+              uint64_t seg_len_ns,
               const secure_save::BundleConfig& bcfg,
               std::function<secure_save::SealArtifacts(const std::vector<uint8_t>&,
                                                        const fs::path&,
@@ -872,6 +924,7 @@ struct SegmentWriter {
         primary_ctx = fs::absolute(out_dir) / "primary.ctx";
         start_ns = start_ts_ns;
         last_ts_ns = start_ts_ns;
+        segment_len_ns = seg_len_ns;
         width = w;
         height = h;
         fps_num = fpsn;
@@ -879,26 +932,16 @@ struct SegmentWriter {
         seal_cb = std::move(seal_cb_in);
 
         std::string base = bundle_dir.filename().string();
-        person_dir = bundle_dir / "person";
-        background_dir = bundle_dir / "background";
-        fs::create_directories(person_dir);
-        fs::create_directories(background_dir);
+        full_dir = bundle_dir / "full";
+        fs::create_directories(full_dir);
 
-        enc_person_path = person_dir / (base + "_person.enc");
-        enc_bg_path = background_dir / (base + "_background.enc");
-        meta_person_path = person_dir / (base + "_person.meta.json");
-        meta_bg_path = background_dir / (base + "_background.meta.json");
-        key_person_prefix = person_dir / (base + "_person");
-        key_bg_prefix = background_dir / (base + "_background");
+        enc_full_path = full_dir / (base + "_full.enc");
+        meta_full_path = full_dir / (base + "_full.meta.json");
+        key_full_prefix = full_dir / (base + "_full");
 
-        key_person = tpm_get_random_32();
-        key_bg = tpm_get_random_32();
-        nonce_person.assign(12, 0);
-        nonce_bg.assign(12, 0);
-        if (RAND_bytes(nonce_person.data(), (int)nonce_person.size()) != 1) {
-            throw std::runtime_error("RAND_bytes failed");
-        }
-        if (RAND_bytes(nonce_bg.data(), (int)nonce_bg.size()) != 1) {
+        key_full = tpm_get_random_32();
+        nonce_full.assign(12, 0);
+        if (RAND_bytes(nonce_full.data(), (int)nonce_full.size()) != 1) {
             throw std::runtime_error("RAND_bytes failed");
         }
 
@@ -906,35 +949,38 @@ struct SegmentWriter {
         aad.assign(aad_s.begin(), aad_s.end());
         auto aad_opt = std::optional<std::vector<uint8_t>>(aad);
 
-        person.begin_pipeline(width, height, fps_num, fps_den);
-        background.begin_pipeline(width, height, fps_num, fps_den);
-
-        person.start(enc_person_path, key_person, nonce_person, aad_opt);
-        background.start(enc_bg_path, key_bg, nonce_bg, aad_opt);
+        full.begin_pipeline(width, height, fps_num, fps_den);
+        full.start(enc_full_path, key_full, nonce_full, aad_opt);
         start_wall = std::chrono::steady_clock::now();
-        split_ns = 0;
+        if (segment_len_ns > 0) {
+            enc_progress.start_meter("Encrypt " + bundle_dir.filename().string(), segment_len_ns);
+        }
     }
 
-    void push(const std::vector<uint8_t>& person_frame,
-              const std::vector<uint8_t>& bg_frame,
+    void push(const std::vector<uint8_t>& frame,
               uint64_t pts_ns,
               uint64_t dur_ns,
               uint64_t epoch_ns) {
         last_ts_ns = epoch_ns;
-        person.push_frame(person_frame, pts_ns, dur_ns);
-        background.push_frame(bg_frame, pts_ns, dur_ns);
+        full.push_frame(frame, pts_ns, dur_ns);
+        if (segment_len_ns > 0 && epoch_ns >= start_ns) {
+            uint64_t done = epoch_ns - start_ns;
+            if (done > segment_len_ns) done = segment_len_ns;
+            enc_progress.update(done);
+        }
     }
 
     void finish(const std::string& camera_id,
                 const secure_save::BundleConfig& bcfg) {
-        person.end_pipeline();
-        background.end_pipeline();
+        full.end_pipeline();
+        if (segment_len_ns > 0) {
+            enc_progress.finish(segment_len_ns);
+        }
 
         auto encode_end = std::chrono::steady_clock::now();
         uint64_t encode_ns = static_cast<uint64_t>(
             std::chrono::duration_cast<std::chrono::nanoseconds>(encode_end - start_wall).count());
-        uint64_t aes_ns = person.encrypt_ns.load(std::memory_order_relaxed) +
-                          background.encrypt_ns.load(std::memory_order_relaxed);
+        uint64_t aes_ns = full.encrypt_ns.load(std::memory_order_relaxed);
 
         std::cerr << "[*] TPM sealing start\n";
         std::cerr.flush();
@@ -942,12 +988,9 @@ struct SegmentWriter {
         if (!seal_cb) {
             throw std::runtime_error("seal callback not set");
         }
-        auto person_artifacts = seal_cb(key_person, key_person_prefix, primary_ctx);
-        auto bg_artifacts = seal_cb(key_bg, key_bg_prefix, primary_ctx);
-        policy_person_file = person_artifacts.policy_file;
-        policy_bg_file = bg_artifacts.policy_file;
-        signer_pub_person = person_artifacts.signer_pub_copy;
-        signer_pub_bg = bg_artifacts.signer_pub_copy;
+        auto full_artifacts = seal_cb(key_full, key_full_prefix, primary_ctx);
+        policy_full_file = full_artifacts.policy_file;
+        signer_pub_full = full_artifacts.signer_pub_copy;
         auto seal_end = std::chrono::steady_clock::now();
         std::cerr << "[*] TPM sealing done\n";
         std::cerr.flush();
@@ -1000,54 +1043,17 @@ struct SegmentWriter {
             { std::ofstream ofs(meta_path); ofs << meta.dump(2); }
         };
 
-        write_meta(meta_person_path, "person", enc_person_path, key_person_prefix,
-                   nonce_person, person.enc.tag, person.enc.plain_bytes, person.enc.cipher_bytes,
-                   policy_person_file, signer_pub_person);
-        write_meta(meta_bg_path, "background", enc_bg_path, key_bg_prefix,
-                   nonce_bg, background.enc.tag, background.enc.plain_bytes, background.enc.cipher_bytes,
-                   policy_bg_file, signer_pub_bg);
+        write_meta(meta_full_path, "full", enc_full_path, key_full_prefix,
+                   nonce_full, full.enc.tag, full.enc.plain_bytes, full.enc.cipher_bytes,
+                   policy_full_file, signer_pub_full);
 
         auto to_sec = [](uint64_t ns) { return static_cast<double>(ns) / 1e9; };
         std::cerr << "[*] Segment timings (s): recv+encode=" << to_sec(encode_ns)
-                  << ", split=" << to_sec(split_ns)
                   << ", aes=" << to_sec(aes_ns)
                   << ", tpm_seal=" << to_sec(seal_ns) << "\n";
         std::cerr << "[*] Segment done. Bundle: " << bundle_dir << "\n";
     }
 };
-
-static void split_frame_person_background(const secure_save::FramePacket& frame,
-                                          std::vector<uint8_t>& person,
-                                          std::vector<uint8_t>& background) {
-    const uint32_t width = frame.width;
-    const uint32_t height = frame.height;
-    const uint32_t channels = 3;
-
-    person.assign(frame.bgr.size(), 0);
-    background = frame.bgr;
-
-    auto clamp = [](int32_t v, int32_t lo, int32_t hi) {
-        if (v < lo) return lo;
-        if (v > hi) return hi;
-        return v;
-    };
-
-    for (const auto& box : frame.boxes) {
-        int32_t x1 = clamp(box.x1, 0, (int32_t)width - 1);
-        int32_t y1 = clamp(box.y1, 0, (int32_t)height - 1);
-        int32_t x2 = clamp(box.x2, 0, (int32_t)width - 1);
-        int32_t y2 = clamp(box.y2, 0, (int32_t)height - 1);
-        if (x2 <= x1 || y2 <= y1) continue;
-
-        for (int32_t y = y1; y <= y2; ++y) {
-            size_t row = (size_t)y * width * channels;
-            size_t start = row + (size_t)x1 * channels;
-            size_t end = row + (size_t)(x2 + 1) * channels;
-            std::memcpy(person.data() + start, frame.bgr.data() + start, end - start);
-            std::memset(background.data() + start, 0, end - start);
-        }
-    }
-}
 
 struct SegmentInfo {
     fs::path meta_path;
@@ -1074,7 +1080,13 @@ static std::vector<SegmentInfo> find_segments(const fs::path& root,
             try { std::ifstream ifs(it.path()); ifs >> meta; } catch (...) { continue; }
             if (!meta.contains("segment_start_ns") || !meta.contains("segment_end_ns")) continue;
             std::string meta_view = meta.value("view", "");
-            if (view != "both" && meta_view != view) continue;
+            if (view != "both") {
+                if (meta_view != view) {
+                    if (!(meta_view == "full" && (view == "person" || view == "background"))) {
+                        continue;
+                    }
+                }
+            }
 
             uint64_t seg_start = meta["segment_start_ns"].get<uint64_t>();
             uint64_t seg_end = meta["segment_end_ns"].get<uint64_t>();
@@ -1140,8 +1152,21 @@ static fs::path decrypt_segment_to_tmp(const fs::path& meta_path,
     if (!unseal_cb) {
         throw std::runtime_error("unseal callback not set");
     }
+
+    auto t_unseal_start = std::chrono::steady_clock::now();
     auto key = unseal_cb(key_prefix, primary_ctx, policy_file, signer_pub_copy);
+    auto t_unseal_end = std::chrono::steady_clock::now();
+
+    auto t_dec_start = std::chrono::steady_clock::now();
     aes_gcm_decrypt_file(enc_path, tmp_out, key, nonce, tag, aad, chunk_size);
+    auto t_dec_end = std::chrono::steady_clock::now();
+
+    auto to_sec = [](const std::chrono::steady_clock::time_point& a,
+                     const std::chrono::steady_clock::time_point& b) {
+        return std::chrono::duration_cast<std::chrono::duration<double>>(b - a).count();
+    };
+    std::cerr << "[*] Decrypt timings (s): tpm_unseal=" << to_sec(t_unseal_start, t_unseal_end)
+              << ", aes=" << to_sec(t_dec_start, t_dec_end) << "\n";
     return tmp_out;
 }
 
@@ -1222,6 +1247,9 @@ std::vector<fs::path> SecureSave::encrypt(const std::vector<FramePacket>& frames
     std::vector<fs::path> bundles;
     if (frames.empty()) return bundles;
 
+    int seg_seconds = segment_seconds > 0 ? segment_seconds : config_.segment_seconds;
+    if (seg_seconds <= 0) seg_seconds = 600;
+
     if (!config_.bundle.policy.server_url.empty() || !config_.bundle.policy.signer_pub.empty()) {
         config_.bundle.policy.enabled = true;
     }
@@ -1242,6 +1270,8 @@ std::vector<fs::path> SecureSave::encrypt(const std::vector<FramePacket>& frames
     }
 
     std::unique_ptr<SegmentWriter> current;
+    ProgressMeter overall_progress;
+    overall_progress.start_meter("Encrypt frames", frames.size());
     uint64_t last_pts_ns = 0;
 
     auto seal_cb = [this](const std::vector<uint8_t>& key,
@@ -1250,33 +1280,28 @@ std::vector<fs::path> SecureSave::encrypt(const std::vector<FramePacket>& frames
         return this->tpm_seal(key, key_prefix, primary_ctx);
     };
 
-    for (const auto& frame : frames) {
+    for (size_t i = 0; i < frames.size(); ++i) {
+        const auto& frame = frames[i];
         if (frame.bgr.empty()) continue;
+        overall_progress.update(i + 1);
 
         if (!current) {
             current = std::make_unique<SegmentWriter>();
             current->init(out_dir, camera_id, frame.width, frame.height, frame.fps_num, frame.fps_den,
-                          frame.timestamp_ns, config_.bundle, seal_cb);
+                          frame.timestamp_ns, (uint64_t)segment_seconds * 1000000000ULL, config_.bundle, seal_cb);
             last_pts_ns = 0;
         }
 
         uint64_t seg_start = current->start_ns;
-        uint64_t seg_len_ns = (uint64_t)segment_seconds * 1000000000ULL;
+    uint64_t seg_len_ns = (uint64_t)seg_seconds * 1000000000ULL;
         if (frame.timestamp_ns - seg_start >= seg_len_ns) {
             current->finish(camera_id, config_.bundle);
             bundles.push_back(current->bundle_dir);
             current = std::make_unique<SegmentWriter>();
             current->init(out_dir, camera_id, frame.width, frame.height, frame.fps_num, frame.fps_den,
-                          frame.timestamp_ns, config_.bundle, seal_cb);
+                          frame.timestamp_ns, (uint64_t)seg_seconds * 1000000000ULL, config_.bundle, seal_cb);
             last_pts_ns = 0;
         }
-
-        std::vector<uint8_t> person;
-        std::vector<uint8_t> background;
-        auto split_start = std::chrono::steady_clock::now();
-        split_frame_person_background(frame, person, background);
-        auto split_end = std::chrono::steady_clock::now();
-        current->split_ns += static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(split_end - split_start).count());
 
         uint64_t dur_ns = (uint64_t)1000000000ULL * frame.fps_den / frame.fps_num;
         uint64_t pts_ns = 0;
@@ -1288,7 +1313,98 @@ std::vector<fs::path> SecureSave::encrypt(const std::vector<FramePacket>& frames
         }
         last_pts_ns = pts_ns;
 
-        current->push(person, background, pts_ns, dur_ns, frame.timestamp_ns);
+        current->push(frame.bgr, pts_ns, dur_ns, frame.timestamp_ns);
+    }
+
+    if (current) {
+        current->finish(camera_id, config_.bundle);
+        bundles.push_back(current->bundle_dir);
+    }
+
+    overall_progress.finish(frames.size());
+
+    return bundles;
+}
+
+std::vector<fs::path> SecureSave::encrypt_stream(const FrameSource& next_frame,
+                                                  const fs::path& out_dir,
+                                                  const std::string& camera_id,
+                                                  int segment_seconds) {
+    std::vector<fs::path> bundles;
+    if (!next_frame) return bundles;
+
+    if (!config_.bundle.policy.server_url.empty() || !config_.bundle.policy.signer_pub.empty()) {
+        config_.bundle.policy.enabled = true;
+    }
+
+    if (config_.bundle.policy.enabled) {
+        if (config_.bundle.policy.server_url.empty() || config_.bundle.policy.signer_pub.empty()) {
+            throw std::runtime_error("PolicySigned requires server_url and signer_pub");
+        }
+        if (!fs::exists(config_.bundle.policy.signer_pub)) {
+            throw std::runtime_error("Policy signer pub not found: " + config_.bundle.policy.signer_pub.string());
+        }
+    }
+
+    std::string obj_auth = config_.object_auth;
+    if (!config_.bundle.policy.enabled && obj_auth.empty()) {
+        obj_auth = get_obj_auth_once();
+        config_.object_auth = obj_auth;
+    }
+
+    int seg_seconds = segment_seconds > 0 ? segment_seconds : config_.segment_seconds;
+    if (seg_seconds <= 0) seg_seconds = 600;
+
+    std::unique_ptr<SegmentWriter> current;
+    uint64_t last_pts_ns = 0;
+
+    auto seal_cb = [this](const std::vector<uint8_t>& key,
+                          const fs::path& key_prefix,
+                          const fs::path& primary_ctx) {
+        return this->tpm_seal(key, key_prefix, primary_ctx);
+    };
+
+    FramePacket frame;
+    bool has_any = false;
+    while (next_frame(frame)) {
+        if (frame.bgr.empty()) {
+            continue;
+        }
+        has_any = true;
+
+        if (!current) {
+            current = std::make_unique<SegmentWriter>();
+            current->init(out_dir, camera_id, frame.width, frame.height, frame.fps_num, frame.fps_den,
+                          frame.timestamp_ns, (uint64_t)seg_seconds * 1000000000ULL, config_.bundle, seal_cb);
+            last_pts_ns = 0;
+        }
+
+        uint64_t seg_start = current->start_ns;
+        uint64_t seg_len_ns = (uint64_t)seg_seconds * 1000000000ULL;
+        if (frame.timestamp_ns - seg_start >= seg_len_ns) {
+            current->finish(camera_id, config_.bundle);
+            bundles.push_back(current->bundle_dir);
+            current = std::make_unique<SegmentWriter>();
+            current->init(out_dir, camera_id, frame.width, frame.height, frame.fps_num, frame.fps_den,
+                          frame.timestamp_ns, (uint64_t)seg_seconds * 1000000000ULL, config_.bundle, seal_cb);
+            last_pts_ns = 0;
+        }
+
+        uint64_t dur_ns = (uint64_t)1000000000ULL * frame.fps_den / frame.fps_num;
+        uint64_t pts_ns = 0;
+        if (frame.timestamp_ns >= current->start_ns) {
+            pts_ns = frame.timestamp_ns - current->start_ns;
+        }
+        if (pts_ns <= last_pts_ns) {
+            pts_ns = last_pts_ns + dur_ns;
+        }
+        last_pts_ns = pts_ns;
+
+        current->push(frame.bgr, pts_ns, dur_ns, frame.timestamp_ns);
+    }
+
+    if (!has_any) {
+        return bundles;
     }
 
     if (current) {
@@ -1390,7 +1506,8 @@ std::map<std::string, fs::path> SecureSave::decrypt(const fs::path& bundle_root,
             continue;
         }
 
-        view_outputs[seg.view].push_back(slice_path);
+        const std::string output_view = (view == "both") ? seg.view : view;
+        view_outputs[output_view].push_back(slice_path);
     }
 
     if (view_outputs.empty()) {

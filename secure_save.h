@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <map>
 #include <optional>
 #include <string>
@@ -24,6 +25,7 @@ struct BundleConfig {
 struct SecureSaveConfig {
     BundleConfig bundle;
     std::string object_auth;
+    int segment_seconds = 600;
 };
 
 struct FrameBox {
@@ -42,6 +44,8 @@ struct FramePacket {
     std::vector<uint8_t> bgr;
     std::vector<FrameBox> boxes;
 };
+
+using FrameSource = std::function<bool(FramePacket&)>;
 
 struct SealArtifacts {
     std::optional<std::filesystem::path> policy_file;
@@ -65,6 +69,11 @@ public:
                                                const std::filesystem::path& out_dir,
                                                const std::string& camera_id,
                                                int segment_seconds);
+
+    std::vector<std::filesystem::path> encrypt_stream(const FrameSource& next_frame,
+                                                      const std::filesystem::path& out_dir,
+                                                      const std::string& camera_id,
+                                                      int segment_seconds);
 
     std::map<std::string, std::filesystem::path> decrypt(const std::filesystem::path& bundle_root,
                                                         const std::filesystem::path& response_dir,
