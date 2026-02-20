@@ -14,10 +14,10 @@ struct RoiBox {
     int32_t y = 0;
     int32_t w = 0;
     int32_t h = 0;
+    int32_t id = -1;
 };
 
 struct RoiMaskerOptions {
-    bool merge_overlaps = true;
     bool strict_stride_check = true;
 };
 

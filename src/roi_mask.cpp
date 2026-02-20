@@ -99,7 +99,7 @@ static RoiBox merge_boxes(const RoiBox& a, const RoiBox& b) {
     int32_t y0 = std::min(a.y, b.y);
     int32_t x1 = std::max(a.x + a.w, b.x + b.w);
     int32_t y1 = std::max(a.y + a.h, b.y + b.h);
-    return RoiBox{x0, y0, x1 - x0, y1 - y0};
+    return RoiBox{x0, y0, x1 - x0, y1 - y0, -1};
 }
 
 static std::string b64e(const std::vector<uint8_t>& in) {
@@ -190,7 +190,7 @@ std::vector<RoiBox> RoiMasker::NormalizeBoxes(const std::vector<RoiBox>& boxes,
             }
             continue;
         }
-        out.push_back(RoiBox{cx0, cy0, cw, ch});
+        out.push_back(RoiBox{cx0, cy0, cw, ch, box.id});
     }
 
     std::sort(out.begin(), out.end(), [](const RoiBox& a, const RoiBox& b) {
@@ -200,7 +200,7 @@ std::vector<RoiBox> RoiMasker::NormalizeBoxes(const std::vector<RoiBox>& boxes,
         return a.w < b.w;
     });
 
-    if (!options.merge_overlaps || out.empty()) {
+    if (out.empty()) {
         return out;
     }
 
@@ -356,7 +356,7 @@ void RoiMetadataJsonlWriter::OnSegmentBegin(const std::string& segment_name,
                                             uint32_t height,
                                             uint32_t fps_num,
                                             uint32_t fps_den) {
-    nlohmann::json header;
+    nlohmann::ordered_json header = nlohmann::ordered_json::object();
     header["type"] = "header";
     header["segment"] = segment_name;
     header["algo"] = algo_;
@@ -370,16 +370,17 @@ void RoiMetadataJsonlWriter::OnSegmentBegin(const std::string& segment_name,
 }
 
 void RoiMetadataJsonlWriter::OnFrame(uint64_t frame_index, const std::vector<RoiBox>& boxes) {
-    nlohmann::json frame;
+    nlohmann::ordered_json frame = nlohmann::ordered_json::object();
     frame["type"] = "frame";
     frame["i"] = frame_index;
-    nlohmann::json arr = nlohmann::json::array();
+    nlohmann::ordered_json arr = nlohmann::ordered_json::array();
     for (const auto& box : boxes) {
-        nlohmann::json b;
+        nlohmann::ordered_json b = nlohmann::ordered_json::object();
+        b["id"] = box.id;
+        b["h"] = box.h;
+        b["w"] = box.w;
         b["x"] = box.x;
         b["y"] = box.y;
-        b["w"] = box.w;
-        b["h"] = box.h;
         arr.push_back(std::move(b));
     }
     frame["boxes"] = std::move(arr);

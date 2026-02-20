@@ -42,6 +42,7 @@
 
 namespace fs = std::filesystem;
 using json = nlohmann::json;
+using ordered_json = nlohmann::ordered_json;
 
 namespace {
 
@@ -267,9 +268,82 @@ static uint64_t compute_pts(uint64_t frame_ts_ns,
     return pts_ns;
 }
 
-static std::map<uint64_t, std::vector<secure_save::RoiBox>> load_roi_boxes_jsonl(
-    const fs::path& sidecar_path) {
-    std::map<uint64_t, std::vector<secure_save::RoiBox>> out;
+template <typename T>
+static T meta_get(const json& meta,
+                  const char* section,
+                  const char* key,
+                  const char* legacy_key,
+                  const T& default_value) {
+    if (section && key) {
+        auto sit = meta.find(section);
+        if (sit != meta.end() && sit->is_object()) {
+            auto kit = sit->find(key);
+            if (kit != sit->end() && !kit->is_null()) {
+                try { return kit->get<T>(); } catch (...) {}
+            }
+        }
+    }
+    if (legacy_key) {
+        auto lit = meta.find(legacy_key);
+        if (lit != meta.end() && !lit->is_null()) {
+            try { return lit->get<T>(); } catch (...) {}
+        }
+    }
+    return default_value;
+}
+
+static bool meta_has(const json& meta,
+                     const char* section,
+                     const char* key,
+                     const char* legacy_key) {
+    if (section && key) {
+        auto sit = meta.find(section);
+        if (sit != meta.end() && sit->is_object()) {
+            auto kit = sit->find(key);
+            if (kit != sit->end() && !kit->is_null()) return true;
+        }
+    }
+    if (legacy_key) {
+        auto lit = meta.find(legacy_key);
+        if (lit != meta.end() && !lit->is_null()) return true;
+    }
+    return false;
+}
+
+static bool has_suffix(const std::string& s, const std::string& suffix) {
+    if (s.size() < suffix.size()) return false;
+    return s.compare(s.size() - suffix.size(), suffix.size(), suffix) == 0;
+}
+
+static std::string strip_suffix(const std::string& s, const std::string& suffix) {
+    if (!has_suffix(s, suffix)) return s;
+    return s.substr(0, s.size() - suffix.size());
+}
+
+static fs::path default_mask_sidecar_from_meta(const fs::path& meta_path) {
+    std::string name = meta_path.filename().string();
+    std::string base = strip_suffix(name, ".meta.json");
+    if (base == name) {
+        base = meta_path.stem().string();
+        base = strip_suffix(base, ".meta");
+    }
+    return meta_path.parent_path() / (base + ".mask.jsonl");
+}
+
+struct RoiSidecarInfo {
+    std::map<uint64_t, std::vector<secure_save::RoiBox>> boxes_by_frame;
+    std::vector<uint8_t> salt;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    uint32_t fps_num = 30;
+    uint32_t fps_den = 1;
+    std::string algo;
+    std::string iv_scheme;
+    bool has_header = false;
+};
+
+static RoiSidecarInfo load_roi_sidecar_jsonl(const fs::path& sidecar_path) {
+    RoiSidecarInfo out;
     std::ifstream ifs(sidecar_path);
     if (!ifs) return out;
 
@@ -282,7 +356,24 @@ static std::map<uint64_t, std::vector<secure_save::RoiBox>> load_roi_boxes_jsonl
         } catch (...) {
             continue;
         }
-        if (!j.contains("type") || j["type"].get<std::string>() != "frame") continue;
+        std::string type = j.value("type", "");
+        if (type == "header") {
+            out.has_header = true;
+            out.algo = j.value("algo", "");
+            out.iv_scheme = j.value("iv_scheme", "");
+            std::string salt_b64 = j.value("salt_b64", "");
+            if (!salt_b64.empty()) {
+                try { out.salt = b64d(salt_b64); } catch (...) {}
+            }
+            out.width = j.value("w", 0U);
+            out.height = j.value("h", 0U);
+            out.fps_num = j.value("fps_num", 30U);
+            out.fps_den = j.value("fps_den", 1U);
+            if (out.fps_num == 0) out.fps_num = 30;
+            if (out.fps_den == 0) out.fps_den = 1;
+            continue;
+        }
+        if (type != "frame") continue;
         uint64_t idx = j.value("i", 0ULL);
         std::vector<secure_save::RoiBox> boxes;
         if (j.contains("boxes") && j["boxes"].is_array()) {
@@ -292,10 +383,11 @@ static std::map<uint64_t, std::vector<secure_save::RoiBox>> load_roi_boxes_jsonl
                 rb.y = b.value("y", 0);
                 rb.w = b.value("w", 0);
                 rb.h = b.value("h", 0);
+                rb.id = b.value("id", -1);
                 boxes.push_back(rb);
             }
         }
-        out[idx] = std::move(boxes);
+        out.boxes_by_frame[idx] = std::move(boxes);
     }
     return out;
 }
@@ -303,20 +395,33 @@ static std::map<uint64_t, std::vector<secure_save::RoiBox>> load_roi_boxes_jsonl
 static fs::path roi_unmask_video(const fs::path& input_path,
                                  const fs::path& output_path,
                                  const std::vector<uint8_t>& master_key,
-                                 const std::vector<uint8_t>& video_salt,
-                                 const fs::path& sidecar_path,
-                                 uint32_t width,
-                                 uint32_t height,
-                                 uint32_t fps_num,
-                                 uint32_t fps_den) {
+                                 const fs::path& sidecar_path) {
     if (master_key.size() != 32) {
         throw std::runtime_error("ROI unmask requires 32-byte master key");
     }
-    if (video_salt.size() != 12) {
-        throw std::runtime_error("ROI unmask requires 12-byte video salt");
+
+    RoiSidecarInfo sidecar = load_roi_sidecar_jsonl(sidecar_path);
+    if (!sidecar.has_header) {
+        throw std::runtime_error("ROI sidecar header missing");
+    }
+    if (sidecar.salt.size() != 12) {
+        throw std::runtime_error("ROI sidecar salt missing or invalid");
+    }
+    if (sidecar.width == 0 || sidecar.height == 0) {
+        throw std::runtime_error("ROI sidecar size missing or invalid");
+    }
+    if (!sidecar.algo.empty() && sidecar.algo != "aes-256-ctr") {
+        throw std::runtime_error("Unsupported ROI algo in sidecar: " + sidecar.algo);
+    }
+    if (!sidecar.iv_scheme.empty() && sidecar.iv_scheme != "sha256(salt|frame|roi)") {
+        throw std::runtime_error("Unsupported ROI iv_scheme in sidecar: " + sidecar.iv_scheme);
     }
 
-    auto boxes_by_frame = load_roi_boxes_jsonl(sidecar_path);
+    uint32_t width = sidecar.width;
+    uint32_t height = sidecar.height;
+    uint32_t fps_num = sidecar.fps_num;
+    uint32_t fps_den = sidecar.fps_den;
+    auto& boxes_by_frame = sidecar.boxes_by_frame;
     bool has_boxes = !boxes_by_frame.empty();
     uint64_t max_frame_index = has_boxes ? boxes_by_frame.rbegin()->first : 0;
     if (has_boxes) {
@@ -330,7 +435,7 @@ static fs::path roi_unmask_video(const fs::path& input_path,
                   << " frames=0 (no boxes)" << "\n";
     }
 
-    std::string input_cmd = "ffmpeg -v error -vsync 0 -i \"" + input_path.string() +
+    std::string input_cmd = "ffmpeg -v error -i \"" + input_path.string() +
                             "\" -f rawvideo -pix_fmt rgb24 -";
     FILE* in_pipe = popen(input_cmd.c_str(), "r");
     if (!in_pipe) throw std::runtime_error("ffmpeg input pipe failed");
@@ -338,8 +443,8 @@ static fs::path roi_unmask_video(const fs::path& input_path,
     std::string fps_str = std::to_string(fps_num) + "/" + std::to_string(fps_den);
     std::string output_cmd = "ffmpeg -v error -y -f rawvideo -pix_fmt rgb24 -s " +
                              std::to_string(width) + "x" + std::to_string(height) +
-                              " -framerate " + fps_str + " -i - -r " + fps_str +
-                             " -vsync 0 -c:v ffv1 -level 3 -g 1 -pix_fmt rgb24 \"" +
+                              " -framerate " + fps_str + " -i - " +
+                             "-c:v ffv1 -level 3 -g 1 -pix_fmt rgb24 \"" +
                               output_path.string() + "\"";
     FILE* out_pipe = popen(output_cmd.c_str(), "w");
     if (!out_pipe) {
@@ -351,7 +456,7 @@ static fs::path roi_unmask_video(const fs::path& input_path,
     std::vector<uint8_t> frame_buf(frame_size);
     secure_save::RoiMaskerOptions options;
     secure_save::RoiMasker masker(options);
-    masker.BeginSegmentWithSalt(master_key.data(), master_key.size(), video_salt);
+    masker.BeginSegmentWithSalt(master_key.data(), master_key.size(), sidecar.salt);
 
     uint64_t frame_index = 0;
     size_t masked_frames = 0;
@@ -505,6 +610,7 @@ static std::vector<secure_save::RoiBox> to_roi_boxes(const std::vector<secure_sa
         r.y = box.y1;
         r.w = box.x2 - box.x1;
         r.h = box.y2 - box.y1;
+        r.id = box.track_id;
         out.push_back(r);
     }
     return out;
@@ -1183,6 +1289,47 @@ static void aes_gcm_decrypt_file(const fs::path& in_path,
     progress.finish(done);
 }
 
+static void aes_gcm_encrypt_file(const fs::path& in_path,
+                                 const fs::path& out_path,
+                                 const std::vector<uint8_t>& key32,
+                                 const std::vector<uint8_t>& nonce12,
+                                 std::vector<uint8_t>& out_tag16,
+                                 const std::optional<std::vector<uint8_t>>& aad,
+                                 size_t chunk_size,
+                                 uint64_t* out_plain_bytes = nullptr,
+                                 uint64_t* out_cipher_bytes = nullptr) {
+    AesGcmEnc enc;
+    std::ifstream fin(in_path, std::ios::binary);
+    if (!fin) throw std::runtime_error("open in failed");
+    std::ofstream fout(out_path, std::ios::binary);
+    if (!fout) throw std::runtime_error("open out failed");
+
+    enc.init(key32, nonce12, aad);
+    std::vector<uint8_t> inbuf(std::max<size_t>(1, chunk_size));
+    uint64_t done = 0;
+    std::error_code ec;
+    uint64_t total = fs::file_size(in_path, ec);
+    ProgressMeter progress;
+    if (!ec && total > 0) {
+        progress.start_meter("Encrypt " + in_path.filename().string(), total);
+    }
+    while (fin) {
+        fin.read((char*)inbuf.data(), (std::streamsize)inbuf.size());
+        std::streamsize got = fin.gcount();
+        if (got <= 0) break;
+        enc.update(inbuf.data(), (size_t)got, fout);
+        done += static_cast<uint64_t>(got);
+        progress.update(done);
+    }
+    enc.finalize(fout);
+    progress.finish(done);
+    fout.flush();
+
+    out_tag16 = enc.tag;
+    if (out_plain_bytes) *out_plain_bytes = enc.plain_bytes;
+    if (out_cipher_bytes) *out_cipher_bytes = enc.cipher_bytes;
+}
+
 struct Chunk {
     std::vector<uint8_t> data;
 };
@@ -1527,7 +1674,6 @@ struct EncPipeline {
                     "-s", size,
                     "-framerate", fps,
                     "-i", "-",
-                    "-vsync", "0",
                     "-an",
                     "-c:v", "ffv1",
                     "-level", "3",
@@ -1826,6 +1972,11 @@ struct HotSegmentWriter {
     std::unique_ptr<secure_save::RoiMasker> roi_masker;
     std::unique_ptr<secure_save::IRoiMetadataSink> roi_metadata;
     fs::path roi_meta_path;
+    fs::path roi_meta_enc_path;
+    std::vector<uint8_t> roi_meta_nonce;
+    std::vector<uint8_t> roi_meta_tag;
+    uint64_t roi_meta_plaintext_bytes = 0;
+    uint64_t roi_meta_ciphertext_bytes = 0;
     size_t roi_frames_total = 0;
     size_t roi_frames_masked = 0;
     size_t roi_boxes_total = 0;
@@ -1864,14 +2015,13 @@ struct HotSegmentWriter {
 
         if (roi_cfg.enabled) {
             secure_save::RoiMaskerOptions options;
-            options.merge_overlaps = roi_cfg.merge_overlaps;
             options.strict_stride_check = roi_cfg.strict_stride_check;
             roi_masker = std::make_unique<secure_save::RoiMasker>(options);
             auto roi_key = rand_key_32();
             roi_masker->BeginSegment(roi_key.data(), roi_key.size());
             roi_video_salt = roi_masker->GetVideoSalt();
             if (roi_cfg.write_sidecar) {
-                roi_meta_path = base_unique; roi_meta_path += "_roi.jsonl";
+                roi_meta_path = base_unique; roi_meta_path += ".mask.jsonl";
                 roi_metadata = std::make_unique<secure_save::RoiMetadataJsonlWriter>(roi_meta_path);
                 roi_metadata->OnSegmentBegin(segment_name, roi_video_salt, width, height, fps_num, fps_den);
             }
@@ -1914,37 +2064,53 @@ struct HotSegmentWriter {
         uint64_t encode_ns = static_cast<uint64_t>(
             std::chrono::duration_cast<std::chrono::nanoseconds>(encode_end - start_wall).count());
 
-        json meta;
-        meta["version"] = 8;
-        meta["encrypted"] = false;
-        meta["cipher"] = "none";
-        meta["created_at_name"] = segment_name;
-        meta["camera_id"] = camera_id;
-        meta["view"] = "full";
-        meta["bundle_dir"] = hot_dir.filename().string();
-        meta["video_file"] = video_path.filename().string();
-        meta["segment_start_ns"] = start_ns;
-        meta["segment_end_ns"] = last_ts_ns;
-        meta["width"] = width;
-        meta["height"] = height;
-        meta["fps_num"] = fps_num;
-        meta["fps_den"] = fps_den;
-        meta["plaintext_bytes"] = full.plain_bytes;
-        meta["source_filename"] = safe_name(camera_id) + "_" + segment_name + "_full.mp4";
+        ordered_json meta = ordered_json::object();
+        meta["version"] = 9;
+        meta["_comment"] = "Hot segment metadata grouped by purpose.";
+
+        ordered_json identity = ordered_json::object();
+        identity["_comment"] = "Who/where this segment belongs to.";
+        identity["created_at_name"] = segment_name;
+        identity["camera_id"] = camera_id;
+        identity["view"] = "full";
+        identity["bundle_dir"] = hot_dir.filename().string();
+        identity["source_filename"] = safe_name(camera_id) + "_" + segment_name + "_full.mp4";
+        meta["identity"] = std::move(identity);
+
+        ordered_json segment = ordered_json::object();
+        segment["_comment"] = "Segment time range in epoch nanoseconds.";
+        segment["start_ns"] = start_ns;
+        segment["end_ns"] = last_ts_ns;
+        meta["segment"] = std::move(segment);
+
+        ordered_json video = ordered_json::object();
+        video["_comment"] = "Video shape and timing.";
+        video["file"] = video_path.filename().string();
+        video["width"] = width;
+        video["height"] = height;
+        video["fps_num"] = fps_num;
+        video["fps_den"] = fps_den;
+        meta["video"] = std::move(video);
+
+        ordered_json payload = ordered_json::object();
+        payload["_comment"] = "Hot payload is plain (not encrypted).";
+        payload["encrypted"] = false;
+        payload["cipher"] = "none";
+        payload["plaintext_bytes"] = full.plain_bytes;
+        meta["payload"] = std::move(payload);
+
+        ordered_json roi = ordered_json::object();
+        roi["_comment"] = "ROI masking metadata. Unmask parameters are stored in sidecar header.";
+        roi["enabled"] = roi_cfg.enabled;
         if (roi_cfg.enabled) {
-            meta["roi_mask"] = true;
-            meta["roi_algo"] = "aes-256-ctr";
-            meta["roi_iv_scheme"] = "sha256(salt|frame|roi)";
-            meta["roi_salt_b64"] = b64e(roi_video_salt);
-            meta["roi_merge_overlaps"] = roi_cfg.merge_overlaps;
-            meta["roi_missing_policy"] = roi_policy_name(roi_cfg.missing_roi_policy);
-            meta["roi_error_policy"] = roi_policy_name(roi_cfg.mask_error_policy);
+            roi["missing_policy"] = roi_policy_name(roi_cfg.missing_roi_policy);
+            roi["error_policy"] = roi_policy_name(roi_cfg.mask_error_policy);
             if (roi_cfg.write_sidecar && !roi_meta_path.empty()) {
-                meta["roi_sidecar"] = roi_meta_path.filename().string();
+                roi["sidecar"] = roi_meta_path.filename().string();
             }
-        } else {
-            meta["roi_mask"] = false;
         }
+        meta["roi"] = std::move(roi);
+
         { std::ofstream ofs(meta_path); ofs << meta.dump(2); }
 
         auto to_sec = [](uint64_t ns) { return static_cast<double>(ns) / 1e9; };
@@ -1992,6 +2158,11 @@ struct ColdSegmentWriter {
     std::unique_ptr<secure_save::RoiMasker> roi_masker;
     std::unique_ptr<secure_save::IRoiMetadataSink> roi_metadata;
     fs::path roi_meta_path;
+    fs::path roi_meta_enc_path;
+    std::vector<uint8_t> roi_meta_nonce;
+    std::vector<uint8_t> roi_meta_tag;
+    uint64_t roi_meta_plaintext_bytes = 0;
+    uint64_t roi_meta_ciphertext_bytes = 0;
     size_t roi_frames_total = 0;
     size_t roi_frames_masked = 0;
     size_t roi_boxes_total = 0;
@@ -2047,13 +2218,17 @@ struct ColdSegmentWriter {
 
         if (roi_cfg.enabled) {
             secure_save::RoiMaskerOptions options;
-            options.merge_overlaps = roi_cfg.merge_overlaps;
             options.strict_stride_check = roi_cfg.strict_stride_check;
             roi_masker = std::make_unique<secure_save::RoiMasker>(options);
             roi_masker->BeginSegment(key_full.data(), key_full.size());
             roi_video_salt = roi_masker->GetVideoSalt();
+            roi_meta_enc_path.clear();
+            roi_meta_nonce.clear();
+            roi_meta_tag.clear();
+            roi_meta_plaintext_bytes = 0;
+            roi_meta_ciphertext_bytes = 0;
             if (roi_cfg.write_sidecar) {
-                roi_meta_path = base_unique; roi_meta_path += "_roi.jsonl";
+                roi_meta_path = base_unique; roi_meta_path += ".mask.jsonl";
                 roi_metadata = std::make_unique<secure_save::RoiMetadataJsonlWriter>(roi_meta_path);
                 roi_metadata->OnSegmentBegin(segment_name, roi_video_salt, width, height, fps_num, fps_den);
             }
@@ -2070,11 +2245,6 @@ struct ColdSegmentWriter {
         full.begin_pipeline(width, height, fps_num, fps_den, lossless);
         full.start(enc_full_path, key_full, nonce_full, aad_opt);
 
-        if (track_cfg.enabled) {
-            fs::path track_path = base_unique;
-            track_path += "_track.json.enc";
-            track_writer.start(track_path, key_full, aad_opt, segment_name, width, height, fps_num, fps_den, track_cfg);
-        }
         start_wall = std::chrono::steady_clock::now();
         if (segment_len_ns > 0) {
             enc_progress.start_meter("Cold segment " + segment_name, segment_len_ns);
@@ -2099,9 +2269,6 @@ struct ColdSegmentWriter {
         if (roi_metadata) {
             roi_metadata->OnSegmentEnd();
         }
-        if (track_cfg.enabled) {
-            track_writer.finish();
-        }
         full.end_pipeline();
         if (segment_len_ns > 0) {
             enc_progress.finish(segment_len_ns);
@@ -2123,6 +2290,22 @@ struct ColdSegmentWriter {
         std::vector<uint8_t> wrapped_key = aes_gcm_encrypt_buf(
             day_key, wrap_nonce, key_full, std::nullopt, wrap_tag);
 
+        if (roi_cfg.enabled && roi_cfg.write_sidecar && !roi_meta_path.empty() && fs::exists(roi_meta_path)) {
+            roi_meta_nonce.assign(12, 0);
+            if (RAND_bytes(roi_meta_nonce.data(), (int)roi_meta_nonce.size()) != 1) {
+                throw std::runtime_error("RAND_bytes failed for roi sidecar nonce");
+            }
+            roi_meta_enc_path = roi_meta_path.parent_path() / (roi_meta_path.stem().string() + ".enc");
+            auto aad_opt = std::optional<std::vector<uint8_t>>(aad);
+            aes_gcm_encrypt_file(roi_meta_path, roi_meta_enc_path, key_full, roi_meta_nonce, roi_meta_tag,
+                                 aad_opt, bcfg.chunk_size, &roi_meta_plaintext_bytes, &roi_meta_ciphertext_bytes);
+            std::error_code rm_ec;
+            fs::remove(roi_meta_path, rm_ec);
+            if (rm_ec) {
+                throw std::runtime_error("Failed to remove plaintext roi sidecar: " + roi_meta_path.string());
+            }
+        }
+
         auto write_meta = [&](const fs::path& meta_path,
                               const std::string& view,
                               const fs::path& enc_path,
@@ -2130,68 +2313,104 @@ struct ColdSegmentWriter {
                               const std::vector<uint8_t>& tag,
                               uint64_t plain_bytes,
                               uint64_t cipher_bytes) {
-            json meta;
-            meta["version"] = 7;
-            meta["encrypted"] = true;
-            meta["cipher"] = "AES-256-GCM";
-            meta["created_at_name"] = created_at;
-            meta["camera_id"] = camera_id;
-            meta["view"] = view;
-            meta["bundle_dir"] = segment_dir.filename().string();
-            meta["enc_file"] = enc_path.filename().string();
-            meta["nonce_b64"] = b64e(nonce);
-            meta["tag_b64"] = b64e(tag);
-            meta["aad_b64"] = aad.empty() ? nullptr : b64e(aad);
-            meta["key_wrap_alg"] = "AES-256-GCM";
-            meta["wrapped_key_b64"] = b64e(wrapped_key);
-            meta["wrap_nonce_b64"] = b64e(wrap_nonce);
-            meta["wrap_tag_b64"] = b64e(wrap_tag);
-            meta["day_key_prefix"] = day_key_prefix.string();
-            meta["day_sealed_pub"] = day_key_prefix.filename().string() + ".pub";
-            meta["day_sealed_priv"] = day_key_prefix.filename().string() + ".priv";
-            meta["primary_ctx"] = primary_ctx.string();
-            if (day_policy_file.has_value() && day_signer_pub.has_value()) {
-                meta["policy_signed"] = true;
-                meta["day_policy_file"] = day_policy_file->filename().string();
-                meta["day_policy_signer_pub"] = day_signer_pub->filename().string();
-            } else {
-                meta["policy_signed"] = false;
+            ordered_json meta = ordered_json::object();
+            meta["version"] = 9;
+            meta["_comment"] = "Cold encrypted segment metadata grouped by purpose.";
+
+            ordered_json identity = ordered_json::object();
+            identity["_comment"] = "Who/where this segment belongs to.";
+            identity["created_at_name"] = created_at;
+            identity["camera_id"] = camera_id;
+            identity["view"] = view;
+            identity["bundle_dir"] = segment_dir.filename().string();
+            identity["source_filename"] = safe_name(camera_id) + "_" + created_at + "_" + view + ".mkv";
+            meta["identity"] = std::move(identity);
+
+            ordered_json segment = ordered_json::object();
+            segment["_comment"] = "Segment time range in epoch nanoseconds.";
+            segment["start_ns"] = start_ns;
+            segment["end_ns"] = last_ts_ns;
+            meta["segment"] = std::move(segment);
+
+            ordered_json video = ordered_json::object();
+            video["_comment"] = "Video shape and timing.";
+            video["width"] = width;
+            video["height"] = height;
+            video["fps_num"] = fps_num;
+            video["fps_den"] = fps_den;
+            meta["video"] = std::move(video);
+
+            ordered_json payload = ordered_json::object();
+            payload["_comment"] = "Encrypted payload information.";
+            payload["encrypted"] = true;
+            payload["cipher"] = "AES-256-GCM";
+            payload["enc_file"] = enc_path.filename().string();
+            payload["chunk_size"] = bcfg.chunk_size;
+            payload["plaintext_bytes"] = plain_bytes;
+            payload["ciphertext_bytes"] = cipher_bytes;
+            meta["payload"] = std::move(payload);
+
+            ordered_json crypto = ordered_json::object();
+            crypto["_comment"] = "Content and wrapped-key crypto material.";
+            crypto["aad_b64"] = aad.empty() ? nullptr : b64e(aad);
+            crypto["nonce_b64"] = b64e(nonce);
+            crypto["tag_b64"] = b64e(tag);
+            crypto["key_wrap_alg"] = "AES-256-GCM";
+            crypto["wrapped_key_b64"] = b64e(wrapped_key);
+            crypto["wrap_nonce_b64"] = b64e(wrap_nonce);
+            crypto["wrap_tag_b64"] = b64e(wrap_tag);
+            meta["crypto"] = std::move(crypto);
+
+            ordered_json tpm = ordered_json::object();
+            tpm["_comment"] = "TPM sealed-key artifacts.";
+            tpm["day_key_prefix"] = day_key_prefix.string();
+            tpm["day_sealed_pub"] = day_key_prefix.filename().string() + ".pub";
+            tpm["day_sealed_priv"] = day_key_prefix.filename().string() + ".priv";
+            tpm["primary_ctx"] = primary_ctx.string();
+            meta["tpm"] = std::move(tpm);
+
+            ordered_json policy = ordered_json::object();
+            policy["_comment"] = "Policy-signed unseal settings.";
+            bool policy_signed = day_policy_file.has_value() && day_signer_pub.has_value();
+            policy["signed"] = policy_signed;
+            if (policy_signed) {
+                policy["day_policy_file"] = day_policy_file->filename().string();
+                policy["day_policy_signer_pub"] = day_signer_pub->filename().string();
             }
-            meta["chunk_size"] = bcfg.chunk_size;
-            meta["plaintext_bytes"] = plain_bytes;
-            meta["ciphertext_bytes"] = cipher_bytes;
-            meta["segment_start_ns"] = start_ns;
-            meta["segment_end_ns"] = last_ts_ns;
-            meta["width"] = width;
-            meta["height"] = height;
-            meta["fps_num"] = fps_num;
-            meta["fps_den"] = fps_den;
-            meta["source_filename"] = safe_name(camera_id) + "_" + created_at + "_" + view + ".mkv";
+            meta["policy"] = std::move(policy);
+
+            ordered_json roi = ordered_json::object();
+            roi["_comment"] = "ROI masking metadata. Unmask parameters are stored in sidecar header.";
+            roi["enabled"] = roi_cfg.enabled;
             if (roi_cfg.enabled) {
-                meta["roi_mask"] = true;
-                meta["roi_algo"] = "aes-256-ctr";
-                meta["roi_iv_scheme"] = "sha256(salt|frame|roi)";
-                meta["roi_salt_b64"] = b64e(roi_video_salt);
-                meta["roi_merge_overlaps"] = roi_cfg.merge_overlaps;
-                meta["roi_missing_policy"] = roi_policy_name(roi_cfg.missing_roi_policy);
-                meta["roi_error_policy"] = roi_policy_name(roi_cfg.mask_error_policy);
-                if (roi_cfg.write_sidecar && !roi_meta_path.empty()) {
-                    meta["roi_sidecar"] = roi_meta_path.filename().string();
+                roi["missing_policy"] = roi_policy_name(roi_cfg.missing_roi_policy);
+                roi["error_policy"] = roi_policy_name(roi_cfg.mask_error_policy);
+                if (!roi_meta_enc_path.empty()) {
+                    roi["enc_file"] = roi_meta_enc_path.filename().string();
+                    roi["nonce_b64"] = b64e(roi_meta_nonce);
+                    roi["tag_b64"] = b64e(roi_meta_tag);
+                    roi["aad_b64"] = aad.empty() ? nullptr : b64e(aad);
+                    roi["plaintext_bytes"] = roi_meta_plaintext_bytes;
+                    roi["ciphertext_bytes"] = roi_meta_ciphertext_bytes;
                 }
-            } else {
-                meta["roi_mask"] = false;
             }
-            if (track_cfg.enabled) {
-                meta["track_schema"] = "track-jsonl-v1";
-                meta["track_bbox_format"] = "x1y1x2y2";
-                meta["track_enc_file"] = track_writer.enc_path.filename().string();
-                meta["track_nonce_b64"] = b64e(track_writer.nonce_bytes());
-                meta["track_tag_b64"] = b64e(track_writer.tag_bytes());
-                meta["track_plaintext_bytes"] = track_writer.plain_bytes();
-                meta["track_ciphertext_bytes"] = track_writer.cipher_bytes();
-                meta["track_aad_b64"] = aad.empty() ? nullptr : b64e(aad);
-                meta["track_include_empty_frames"] = track_cfg.include_empty_frames;
+            meta["roi"] = std::move(roi);
+
+            if (track_cfg.enabled && track_writer.started) {
+                ordered_json track = ordered_json::object();
+                track["_comment"] = "Encrypted tracking jsonl metadata.";
+                track["schema"] = "track-jsonl-v1";
+                track["bbox_format"] = "x1y1x2y2";
+                track["enc_file"] = track_writer.enc_path.filename().string();
+                track["nonce_b64"] = b64e(track_writer.nonce_bytes());
+                track["tag_b64"] = b64e(track_writer.tag_bytes());
+                track["aad_b64"] = aad.empty() ? nullptr : b64e(aad);
+                track["plaintext_bytes"] = track_writer.plain_bytes();
+                track["ciphertext_bytes"] = track_writer.cipher_bytes();
+                track["include_empty_frames"] = track_cfg.include_empty_frames;
+                meta["track"] = std::move(track);
             }
+
             { std::ofstream ofs(meta_path); ofs << meta.dump(2); }
         };
 
@@ -2239,12 +2458,11 @@ static const std::vector<uint8_t>* apply_roi_mask_for_segment(
         }
         if (policy == secure_save::SecureSaveConfig::RoiMaskConfig::FailPolicy::FailClose) {
             fill_black(masked_out);
-            record_boxes = {secure_save::RoiBox{0, 0, (int32_t)frame.width, (int32_t)frame.height}};
+            record_boxes = {secure_save::RoiBox{0, 0, (int32_t)frame.width, (int32_t)frame.height, -1}};
         }
     } else {
         auto boxes = to_roi_boxes(frame.boxes);
         secure_save::RoiMaskerOptions options;
-        options.merge_overlaps = roi_cfg.merge_overlaps;
         options.strict_stride_check = roi_cfg.strict_stride_check;
         try {
             record_boxes = secure_save::RoiMasker::NormalizeBoxes(
@@ -2257,7 +2475,7 @@ static const std::vector<uint8_t>* apply_roi_mask_for_segment(
                 }
                 if (policy == secure_save::SecureSaveConfig::RoiMaskConfig::FailPolicy::FailClose) {
                     record_boxes = secure_save::RoiMasker::NormalizeBoxes(
-                        {secure_save::RoiBox{0, 0, (int32_t)frame.width, (int32_t)frame.height}},
+                        {secure_save::RoiBox{0, 0, (int32_t)frame.width, (int32_t)frame.height, -1}},
                         frame.width, frame.height, stride, options);
                 }
             }
@@ -2273,7 +2491,7 @@ static const std::vector<uint8_t>* apply_roi_mask_for_segment(
             }
             if (policy == secure_save::SecureSaveConfig::RoiMaskConfig::FailPolicy::FailClose) {
                 fill_black(masked_out);
-                record_boxes = {secure_save::RoiBox{0, 0, (int32_t)frame.width, (int32_t)frame.height}};
+                record_boxes = {secure_save::RoiBox{0, 0, (int32_t)frame.width, (int32_t)frame.height, -1}};
             } else {
                 record_boxes.clear();
             }
@@ -2320,13 +2538,15 @@ static std::vector<SegmentInfo> find_segments(const fs::path& root,
 
             json meta;
             try { std::ifstream ifs(it.path()); ifs >> meta; } catch (...) { continue; }
-            if (meta.contains("encrypted")) {
-                if (!meta["encrypted"].is_boolean() || !meta["encrypted"].get<bool>()) continue;
+            if (meta_has(meta, "payload", "encrypted", "encrypted")) {
+                if (!meta_get<bool>(meta, "payload", "encrypted", "encrypted", false)) continue;
             }
-            std::string cipher = meta.value("cipher", "");
+            std::string cipher = meta_get<std::string>(meta, "payload", "cipher", "cipher", "");
             if (!cipher.empty() && cipher != "AES-256-GCM") continue;
-            if (!meta.contains("segment_start_ns") || !meta.contains("segment_end_ns")) continue;
-            std::string meta_view = meta.value("view", "");
+            bool has_start = meta_has(meta, "segment", "start_ns", "segment_start_ns");
+            bool has_end = meta_has(meta, "segment", "end_ns", "segment_end_ns");
+            if (!has_start || !has_end) continue;
+            std::string meta_view = meta_get<std::string>(meta, "identity", "view", "view", "");
             if (view != "both") {
                 if (meta_view != view) {
                     if (!(meta_view == "full" && (view == "person" || view == "background"))) {
@@ -2335,8 +2555,8 @@ static std::vector<SegmentInfo> find_segments(const fs::path& root,
                 }
             }
 
-            uint64_t seg_start = meta["segment_start_ns"].get<uint64_t>();
-            uint64_t seg_end = meta["segment_end_ns"].get<uint64_t>();
+            uint64_t seg_start = meta_get<uint64_t>(meta, "segment", "start_ns", "segment_start_ns", 0ULL);
+            uint64_t seg_end = meta_get<uint64_t>(meta, "segment", "end_ns", "segment_end_ns", 0ULL);
             if (seg_end < start_ns || seg_start > end_ns) continue;
 
             out.push_back({it.path(), seg_start, seg_end, meta_view});
@@ -2362,32 +2582,34 @@ static fs::path decrypt_segment_to_tmp(const fs::path& meta_path,
     { std::ifstream ifs(meta_path); ifs >> meta; }
     fs::path base_dir = meta_path.parent_path();
 
-    fs::path enc_path = base_dir / meta.at("enc_file").get<std::string>();
-    fs::path primary_ctx = meta.value("primary_ctx", "primary.ctx");
+    fs::path enc_path = base_dir / meta_get<std::string>(meta, "payload", "enc_file", "enc_file", "");
+    fs::path primary_ctx = meta_get<std::string>(meta, "tpm", "primary_ctx", "primary_ctx", "primary.ctx");
     if (!primary_ctx.is_absolute()) {
         primary_ctx = base_dir / primary_ctx;
     }
-    bool wrapped_key = meta.contains("wrapped_key_b64")
-        && meta.contains("wrap_nonce_b64")
-        && meta.contains("wrap_tag_b64")
-        && meta.contains("day_key_prefix");
+    bool wrapped_key = meta_has(meta, "crypto", "wrapped_key_b64", "wrapped_key_b64")
+        && meta_has(meta, "crypto", "wrap_nonce_b64", "wrap_nonce_b64")
+        && meta_has(meta, "crypto", "wrap_tag_b64", "wrap_tag_b64")
+        && meta_has(meta, "tpm", "day_key_prefix", "day_key_prefix");
 
-    auto nonce = b64d(meta.at("nonce_b64").get<std::string>());
-    auto tag = b64d(meta.at("tag_b64").get<std::string>());
+    auto nonce = b64d(meta_get<std::string>(meta, "crypto", "nonce_b64", "nonce_b64", ""));
+    auto tag = b64d(meta_get<std::string>(meta, "crypto", "tag_b64", "tag_b64", ""));
 
     std::optional<std::vector<uint8_t>> aad;
-    if (meta.contains("aad_b64") && !meta["aad_b64"].is_null()) {
-        aad = b64d(meta["aad_b64"].get<std::string>());
+    if (meta_has(meta, "crypto", "aad_b64", "aad_b64")) {
+        aad = b64d(meta_get<std::string>(meta, "crypto", "aad_b64", "aad_b64", ""));
     }
 
-    size_t chunk_size = (size_t)meta.value("chunk_size", (int)cfg.chunk_size);
+    size_t chunk_size = (size_t)meta_get<uint64_t>(meta, "payload", "chunk_size", "chunk_size",
+                                                   static_cast<uint64_t>(cfg.chunk_size));
 
-    std::string source_filename = meta.value("source_filename", "segment.mp4");
+    std::string source_filename = meta_get<std::string>(meta, "identity", "source_filename", "source_filename",
+                                                        "segment.mp4");
     fs::create_directories(tmp_dir);
     fs::path base = tmp_dir / (source_filename + ".dec.mkv");
     fs::path tmp_out = unique_path(base);
 
-    bool policy_signed = meta.value("policy_signed", false);
+    bool policy_signed = meta_get<bool>(meta, "policy", "signed", "policy_signed", false);
 
     if (!unseal_cb) {
         throw std::runtime_error("unseal callback not set");
@@ -2398,7 +2620,7 @@ static fs::path decrypt_segment_to_tmp(const fs::path& meta_path,
     auto t_unseal_end = t_unseal_start;
 
     if (wrapped_key) {
-        fs::path day_key_prefix = meta.value("day_key_prefix", "");
+        fs::path day_key_prefix = meta_get<std::string>(meta, "tpm", "day_key_prefix", "day_key_prefix", "");
         if (day_key_prefix.empty()) {
             throw std::runtime_error("day_key_prefix missing in meta");
         }
@@ -2409,8 +2631,8 @@ static fs::path decrypt_segment_to_tmp(const fs::path& meta_path,
         std::optional<fs::path> policy_file;
         std::optional<fs::path> signer_pub_copy;
         if (policy_signed) {
-            std::string policy_name = meta.value("day_policy_file", "");
-            std::string signer_name = meta.value("day_policy_signer_pub", "");
+            std::string policy_name = meta_get<std::string>(meta, "policy", "day_policy_file", "day_policy_file", "");
+            std::string signer_name = meta_get<std::string>(meta, "policy", "day_policy_signer_pub", "day_policy_signer_pub", "");
             if (policy_name.empty() || signer_name.empty()) {
                 throw std::runtime_error("policy metadata missing in meta");
             }
@@ -2437,20 +2659,20 @@ static fs::path decrypt_segment_to_tmp(const fs::path& meta_path,
             }
         }
 
-        auto wrapped = b64d(meta.at("wrapped_key_b64").get<std::string>());
-        auto wrap_nonce = b64d(meta.at("wrap_nonce_b64").get<std::string>());
-        auto wrap_tag = b64d(meta.at("wrap_tag_b64").get<std::string>());
+        auto wrapped = b64d(meta_get<std::string>(meta, "crypto", "wrapped_key_b64", "wrapped_key_b64", ""));
+        auto wrap_nonce = b64d(meta_get<std::string>(meta, "crypto", "wrap_nonce_b64", "wrap_nonce_b64", ""));
+        auto wrap_tag = b64d(meta_get<std::string>(meta, "crypto", "wrap_tag_b64", "wrap_tag_b64", ""));
         key = aes_gcm_decrypt_buf(day_key, wrap_nonce, wrapped, wrap_tag, std::nullopt);
         if (key.size() != 32) {
             throw std::runtime_error("Unexpected wrapped key length");
         }
     } else {
-        fs::path key_prefix = base_dir / meta.at("key_prefix").get<std::string>();
+        fs::path key_prefix = base_dir / meta_get<std::string>(meta, "tpm", "key_prefix", "key_prefix", "");
         std::optional<fs::path> policy_file;
         std::optional<fs::path> signer_pub_copy;
         if (policy_signed) {
-            policy_file = base_dir / meta.value("policy_file", "");
-            signer_pub_copy = base_dir / meta.value("policy_signer_pub", "");
+            policy_file = base_dir / meta_get<std::string>(meta, "policy", "policy_file", "policy_file", "");
+            signer_pub_copy = base_dir / meta_get<std::string>(meta, "policy", "policy_signer_pub", "policy_signer_pub", "");
             if (policy_file->empty() || signer_pub_copy->empty()) {
                 throw std::runtime_error("policy metadata missing in meta");
             }
@@ -2712,6 +2934,12 @@ FramePacket build_frame_packet_from_unified(const UnifiedBuffer& unified,
     return frame;
 }
 
+static uint64_t frames_per_segment(uint32_t fps_num, uint32_t fps_den, int segment_seconds) {
+    if (fps_num == 0 || fps_den == 0 || segment_seconds <= 0) return 0;
+    uint64_t num = static_cast<uint64_t>(segment_seconds) * static_cast<uint64_t>(fps_num);
+    return (num + static_cast<uint64_t>(fps_den) - 1ULL) / static_cast<uint64_t>(fps_den);
+}
+
 std::vector<fs::path> SecureSave::encrypt(const std::vector<FramePacket>& frames,
                                           const fs::path& out_dir,
                                           const std::string& camera_id,
@@ -2759,6 +2987,7 @@ std::vector<fs::path> SecureSave::encrypt(const std::vector<FramePacket>& frames
     uint64_t last_pts_hot = 0;
     uint64_t last_pts_cold = 0;
     uint64_t hot_frame_index = 0;
+    uint64_t hot_frames_per_segment = 0;
     uint64_t cold_frame_index = 0;
 
     ProgressMeter overall_progress;
@@ -2817,10 +3046,17 @@ std::vector<fs::path> SecureSave::encrypt(const std::vector<FramePacket>& frames
                           frame.timestamp_ns, (uint64_t)hot_seconds * 1000000000ULL, config_.roi_mask);
                 last_pts_hot = 0;
                 hot_frame_index = 0;
+                hot_frames_per_segment = frames_per_segment(frame.fps_num, frame.fps_den, hot_seconds);
             }
 
             uint64_t hot_len_ns = (uint64_t)hot_seconds * 1000000000ULL;
-            if (frame.timestamp_ns - hot->start_ns >= hot_len_ns) {
+            bool rotate_hot = false;
+            if (hot_frames_per_segment > 0) {
+                rotate_hot = (hot_frame_index >= hot_frames_per_segment);
+            } else {
+                rotate_hot = (frame.timestamp_ns - hot->start_ns >= hot_len_ns);
+            }
+            if (rotate_hot) {
                 hot->finish(camera_id);
                 outputs.push_back(hot->video_path);
                 cleanup_hot_dir(hot_root, config_.storage.hot_retention_hours);
@@ -2829,6 +3065,7 @@ std::vector<fs::path> SecureSave::encrypt(const std::vector<FramePacket>& frames
                           frame.timestamp_ns, (uint64_t)hot_seconds * 1000000000ULL, config_.roi_mask);
                 last_pts_hot = 0;
                 hot_frame_index = 0;
+                hot_frames_per_segment = frames_per_segment(frame.fps_num, frame.fps_den, hot_seconds);
             }
 
             uint64_t pts_hot = compute_pts(frame.timestamp_ns, hot->start_ns, dur_ns, last_pts_hot);
@@ -2939,6 +3176,7 @@ std::vector<fs::path> SecureSave::encrypt_stream(const FrameSource& next_frame,
     uint64_t last_pts_hot = 0;
     uint64_t last_pts_cold = 0;
     uint64_t hot_frame_index = 0;
+    uint64_t hot_frames_per_segment = 0;
     uint64_t cold_frame_index = 0;
 
     std::map<std::string, DayKeyState> day_key_cache;
@@ -2999,10 +3237,17 @@ std::vector<fs::path> SecureSave::encrypt_stream(const FrameSource& next_frame,
                           frame.timestamp_ns, (uint64_t)hot_seconds * 1000000000ULL, config_.roi_mask);
                 last_pts_hot = 0;
                 hot_frame_index = 0;
+                hot_frames_per_segment = frames_per_segment(frame.fps_num, frame.fps_den, hot_seconds);
             }
 
             uint64_t hot_len_ns = (uint64_t)hot_seconds * 1000000000ULL;
-            if (frame.timestamp_ns - hot->start_ns >= hot_len_ns) {
+            bool rotate_hot = false;
+            if (hot_frames_per_segment > 0) {
+                rotate_hot = (hot_frame_index >= hot_frames_per_segment);
+            } else {
+                rotate_hot = (frame.timestamp_ns - hot->start_ns >= hot_len_ns);
+            }
+            if (rotate_hot) {
                 hot->finish(camera_id);
                 outputs.push_back(hot->video_path);
                 cleanup_hot_dir(hot_root, config_.storage.hot_retention_hours);
@@ -3011,6 +3256,7 @@ std::vector<fs::path> SecureSave::encrypt_stream(const FrameSource& next_frame,
                           frame.timestamp_ns, (uint64_t)hot_seconds * 1000000000ULL, config_.roi_mask);
                 last_pts_hot = 0;
                 hot_frame_index = 0;
+                hot_frames_per_segment = frames_per_segment(frame.fps_num, frame.fps_den, hot_seconds);
             }
 
             uint64_t pts_hot = compute_pts(frame.timestamp_ns, hot->start_ns, dur_ns, last_pts_hot);
@@ -3080,7 +3326,8 @@ std::map<std::string, fs::path> SecureSave::decrypt(const fs::path& bundle_root,
                                                     const fs::path& response_dir,
                                                     uint64_t start_ms,
                                                     uint64_t end_ms,
-                                                    const std::string& view) {
+                                                    const std::string& view,
+                                                    bool enable_roi_unmask) {
     if (!config_.bundle.policy.server_url.empty() || !config_.bundle.policy.signer_pub.empty()) {
         config_.bundle.policy.enabled = true;
     }
@@ -3125,33 +3372,77 @@ std::map<std::string, fs::path> SecureSave::decrypt(const fs::path& bundle_root,
         json meta;
         { std::ifstream ifs(seg.meta_path); ifs >> meta; }
 
-        uint64_t cipher_bytes = meta.value("ciphertext_bytes", 0ULL);
-        uint64_t plain_bytes = meta.value("plaintext_bytes", 0ULL);
+        uint64_t cipher_bytes = meta_get<uint64_t>(meta, "payload", "ciphertext_bytes", "ciphertext_bytes", 0ULL);
+        uint64_t plain_bytes = meta_get<uint64_t>(meta, "payload", "plaintext_bytes", "plaintext_bytes", 0ULL);
         if (cipher_bytes == 0 || plain_bytes == 0) {
             continue;
         }
 
-        uint64_t fps_num = meta.value("fps_num", 30ULL);
-        uint64_t fps_den = meta.value("fps_den", 1ULL);
+        uint64_t fps_num = meta_get<uint64_t>(meta, "video", "fps_num", "fps_num", 30ULL);
+        uint64_t fps_den = meta_get<uint64_t>(meta, "video", "fps_den", "fps_den", 1ULL);
         if (fps_num == 0) fps_num = 30;
         if (fps_den == 0) fps_den = 1;
         uint64_t frame_duration_ns = 1000000000ULL * fps_den / fps_num;
-        size_t chunk_size = (size_t)meta.value("chunk_size", (int)config_.bundle.chunk_size);
+        size_t chunk_size = (size_t)meta_get<uint64_t>(meta, "payload", "chunk_size", "chunk_size",
+                                                       static_cast<uint64_t>(config_.bundle.chunk_size));
 
         std::vector<uint8_t> key_full;
         fs::path dec_path = decrypt_segment_to_tmp(seg.meta_path, config_.bundle, tmp_dir,
                                                    &day_key_cache, unseal_cb, &key_full);
 
-        if (meta.contains("track_enc_file") && meta.contains("track_nonce_b64") && meta.contains("track_tag_b64")) {
-            fs::path track_enc = seg.meta_path.parent_path() / meta.at("track_enc_file").get<std::string>();
+        fs::path roi_sidecar;
+        fs::path roi_sidecar_tmp;
+        if (meta_has(meta, "roi", "enc_file", nullptr)
+            && meta_has(meta, "roi", "nonce_b64", nullptr)
+            && meta_has(meta, "roi", "tag_b64", nullptr)
+            && key_full.size() == 32) {
+            fs::path roi_enc = seg.meta_path.parent_path()
+                / meta_get<std::string>(meta, "roi", "enc_file", nullptr, "");
+            if (fs::exists(roi_enc)) {
+                auto roi_nonce = b64d(meta_get<std::string>(meta, "roi", "nonce_b64", nullptr, ""));
+                auto roi_tag = b64d(meta_get<std::string>(meta, "roi", "tag_b64", nullptr, ""));
+                std::optional<std::vector<uint8_t>> roi_aad;
+                if (meta_has(meta, "roi", "aad_b64", nullptr)) {
+                    roi_aad = b64d(meta_get<std::string>(meta, "roi", "aad_b64", nullptr, ""));
+                } else if (meta_has(meta, "crypto", "aad_b64", "aad_b64")) {
+                    roi_aad = b64d(meta_get<std::string>(meta, "crypto", "aad_b64", "aad_b64", ""));
+                }
+                roi_sidecar_tmp = tmp_dir / (seg.meta_path.stem().string() + ".mask.jsonl");
+                aes_gcm_decrypt_file(roi_enc, roi_sidecar_tmp, key_full, roi_nonce, roi_tag, roi_aad, chunk_size);
+                roi_sidecar = roi_sidecar_tmp;
+            }
+        }
+        if (roi_sidecar.empty()) {
+            std::string sidecar_name = meta_get<std::string>(meta, "roi", "sidecar", "roi_sidecar", "");
+            fs::path fallback = sidecar_name.empty()
+                ? default_mask_sidecar_from_meta(seg.meta_path)
+                : (seg.meta_path.parent_path() / sidecar_name);
+            if (fs::exists(fallback)) {
+                roi_sidecar = fallback;
+            }
+        }
+
+        bool track_added = false;
+        if (!roi_sidecar.empty() && fs::exists(roi_sidecar)) {
+            fs::path track_out = tmp_dir / (seg.meta_path.stem().string() + ".track.jsonl");
+            fs::copy_file(roi_sidecar, track_out, fs::copy_options::overwrite_existing);
+            track_outputs.push_back(track_out);
+            track_added = true;
+        }
+        if (!track_added
+            && meta_has(meta, "track", "enc_file", "track_enc_file")
+            && meta_has(meta, "track", "nonce_b64", "track_nonce_b64")
+            && meta_has(meta, "track", "tag_b64", "track_tag_b64")) {
+            fs::path track_enc = seg.meta_path.parent_path()
+                / meta_get<std::string>(meta, "track", "enc_file", "track_enc_file", "");
             if (fs::exists(track_enc) && key_full.size() == 32) {
-                auto track_nonce = b64d(meta.at("track_nonce_b64").get<std::string>());
-                auto track_tag = b64d(meta.at("track_tag_b64").get<std::string>());
+                auto track_nonce = b64d(meta_get<std::string>(meta, "track", "nonce_b64", "track_nonce_b64", ""));
+                auto track_tag = b64d(meta_get<std::string>(meta, "track", "tag_b64", "track_tag_b64", ""));
                 std::optional<std::vector<uint8_t>> track_aad;
-                if (meta.contains("track_aad_b64") && !meta["track_aad_b64"].is_null()) {
-                    track_aad = b64d(meta["track_aad_b64"].get<std::string>());
-                } else if (meta.contains("aad_b64") && !meta["aad_b64"].is_null()) {
-                    track_aad = b64d(meta["aad_b64"].get<std::string>());
+                if (meta_has(meta, "track", "aad_b64", "track_aad_b64")) {
+                    track_aad = b64d(meta_get<std::string>(meta, "track", "aad_b64", "track_aad_b64", ""));
+                } else if (meta_has(meta, "crypto", "aad_b64", "aad_b64")) {
+                    track_aad = b64d(meta_get<std::string>(meta, "crypto", "aad_b64", "aad_b64", ""));
                 }
                 fs::path track_out = tmp_dir / (seg.meta_path.stem().string() + ".track.jsonl");
                 aes_gcm_decrypt_file(track_enc, track_out, key_full, track_nonce, track_tag, track_aad, chunk_size);
@@ -3182,22 +3473,13 @@ std::map<std::string, fs::path> SecureSave::decrypt(const fs::path& bundle_root,
         fs::path slice_input = dec_path;
         fs::path unmask_path;
         bool do_unmask = false;
-        if (config_.roi_mask.unmask_on_decrypt && meta.value("roi_mask", false)) {
-            if (meta.contains("roi_sidecar") && meta.contains("roi_salt_b64")) {
-                std::string sidecar_name = meta.value("roi_sidecar", "");
-                if (!sidecar_name.empty()) {
-                    fs::path sidecar = seg.meta_path.parent_path() / sidecar_name;
-                    auto salt = b64d(meta.at("roi_salt_b64").get<std::string>());
-                    uint32_t width = meta.value("width", 0U);
-                    uint32_t height = meta.value("height", 0U);
-                    if (width > 0 && height > 0 && fs::exists(sidecar)) {
-                        unmask_path = tmp_dir / (seg.meta_path.stem().string() + ".unmask.mkv");
-                        roi_unmask_video(dec_path, unmask_path, key_full, salt, sidecar,
-                                         width, height, (uint32_t)fps_num, (uint32_t)fps_den);
-                        slice_input = unmask_path;
-                        do_unmask = true;
-                    }
-                }
+        bool roi_enabled = meta_get<bool>(meta, "roi", "enabled", "roi_mask", false);
+        if (enable_roi_unmask && roi_enabled) {
+            if (!roi_sidecar.empty() && fs::exists(roi_sidecar)) {
+                unmask_path = tmp_dir / (seg.meta_path.stem().string() + ".unmask.mkv");
+                roi_unmask_video(dec_path, unmask_path, key_full, roi_sidecar);
+                slice_input = unmask_path;
+                do_unmask = true;
             }
         }
 
@@ -3220,6 +3502,10 @@ std::map<std::string, fs::path> SecureSave::decrypt(const fs::path& bundle_root,
             if (do_unmask && !unmask_path.empty()) {
                 fs::remove(unmask_path, ec);
             }
+        }
+        if (!roi_sidecar_tmp.empty()) {
+            std::error_code roi_ec;
+            fs::remove(roi_sidecar_tmp, roi_ec);
         }
 
         if (ec || slice_path.empty() || !fs::exists(slice_path)) {
@@ -3248,7 +3534,11 @@ std::map<std::string, fs::path> SecureSave::decrypt(const fs::path& bundle_root,
             }
         }
 
-        fs::path final_path = response_dir / ("merged_" + kv.first + "_" + now_ts_name() + ".mp4");
+        const std::string video_ts = now_ts_name();
+        const std::string video_name = (kv.first == "full")
+            ? (video_ts + ".mp4")
+            : (kv.first + "_" + video_ts + ".mp4");
+        fs::path final_path = response_dir / video_name;
         ffmpeg_transcode_to_mp4(lossless_path, final_path);
         outputs[kv.first] = final_path;
         std::error_code ec;
@@ -3256,7 +3546,7 @@ std::map<std::string, fs::path> SecureSave::decrypt(const fs::path& bundle_root,
     }
 
     if (!track_outputs.empty()) {
-        fs::path track_path = response_dir / ("merged_track_" + now_ts_name() + ".jsonl");
+        fs::path track_path = response_dir / (now_ts_name() + ".mask.jsonl");
         concat_jsonl_files(track_outputs, track_path);
         outputs["track"] = track_path;
         for (const auto& p : track_outputs) {

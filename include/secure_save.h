@@ -42,7 +42,6 @@ struct SecureSaveConfig {
     struct RoiMaskConfig {
         enum class FailPolicy { FailOpen, FailClose, FailHard };
         bool enabled = true;
-        bool merge_overlaps = true;
         bool strict_stride_check = true;
         bool write_sidecar = true;
         bool unmask_on_decrypt = false;
@@ -108,7 +107,8 @@ public:
                                                         const std::filesystem::path& response_dir,
                                                         uint64_t start_ms,
                                                         uint64_t end_ms,
-                                                        const std::string& view);
+                                                        const std::string& view,
+                                                        bool enable_roi_unmask = false);
 
 private:
     SealArtifacts tpm_seal(const std::vector<uint8_t>& key32,
